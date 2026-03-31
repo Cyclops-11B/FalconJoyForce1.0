@@ -1,0 +1,19 @@
+# Falcon button mapping
+# Each line: falcon_button=xbox_button
+# Falcon buttons: 0, 1, 2, 3
+#
+# Available Xbox outputs:
+#   A, B, X, Y
+#   START, BACK
+#   LB, RB        (bumpers)
+#   LT, RT        (triggers - analog, fully on or off)
+#   LS, RS        (stick clicks)
+#   DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT
+#   NONE          (disables the button)
+#
+# Note: falcon0 also controls recoil haptics when RT is assigned
+
+falcon0=RT
+falcon1=LT
+falcon2=RB
+falcon3=RS
