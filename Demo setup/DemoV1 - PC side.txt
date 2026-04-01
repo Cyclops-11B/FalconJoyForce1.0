@@ -1,4 +1,4 @@
-﻿// Falcon - Mouse emulation joystick with Force
+// Falcon - Mouse emulation joystick with Force
 // Novint Falcon -> Pico 2 W (CP2102 serial) -> Xbox 360 controller
 
 #include <windows.h>
@@ -20,17 +20,14 @@ static const int    UPDATE_RATE_MS = 1;
 static const bool   INVERT_X = false;
 static const bool   INVERT_Y = false;
 
-static const double VEL_SENSITIVITY = 5.0; // Higher means more stick travel per handle travel
+static const double VEL_SENSITIVITY = 6.0; // Higher means more stick travel per handle travel
 static const double VEL_DEADZONE = 0.0004; // Set lower to eliminate noise and small movements
-static const double VEL_CURVE = 0.60; // less than 1.0 boosts small motions; 1.0 = linear
-static const double VEL_SLOW_THRESHOLD = 0.06;  // below this = fine zone
-static const double VEL_SLOW_BOOST = 2.5;   // extra multiplier in fine zone
-//Velocity curve Alpha - line 205 - lower number averages out small quick corrections
+static const double VEL_CURVE = 0.65; // less than 1.0 boosts small motions; 1.0 = linear
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
 static const double PUSH_SPEED_BASE = 0.34; // how fast cursor moves when entering push zone
-static const double PUSH_SPEED_MAX = 3.0; // maximum push speed at full tilt
+static const double PUSH_SPEED_MAX = 2.0; // maximum push speed at full tilt
 static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
 
 static const double PUSH_DAMP_COEFF = 0.5; // damping strength on direction reversal (0=none, 1=strong)
@@ -49,27 +46,24 @@ static const double RUMBLE_FORCE_SCALE = 12.0; // overall scale factor of rumbe 
 static const double RECOIL_DECAY = 0.30; // lower = snappier
 static const DWORD  RECOIL_WINDOW_MS = 150; // ms after btn 1 release to still catch trigger recoil
 static const double RECOIL_CURVE = 0.5; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
-static const double RECOIL_AIM_DAMP = 0.55;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
+static const double RECOIL_AIM_DAMP = 0.7;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
 // Attack time: how long (in seconds) recoil ramps from 0 to peak before decaying
 // 0.0 = instant peak (original behavior), 0.02 = 20ms ramp, 0.05 = 50ms ramp
 static const double RECOIL_ATTACK_SEC = 0.0;
-static const DWORD  IMPULSE_GAP_MS = 35;  //Gap between force generation and next force - too small and forces blend, wider for more distinct pushes
-
-static const double RUMBLE_SUSTAIN_THRESHOLD = 0.15; // min rumble mag to auto-requeue a sustain impulse
-static const double RUMBLE_SUSTAIN_SCALE = 0.85;     // fraction of current rumble to use as sustain peak
-
+static const DWORD  IMPULSE_GAP_MS = 45;
 // ── Recoil impulse queue ───────────────────────────────────────────────────
+// Stores pending impulse peaks so rapid fire never drops a shot
 #define RECOIL_QUEUE_SIZE 64
 static double g_recoilQueue[RECOIL_QUEUE_SIZE] = {};
-static int    g_recoilQHead = 0;
-static int    g_recoilQTail = 0;
-static DWORD  g_lastRumbleTime = 0;
+static int    g_recoilQHead = 0;  // next slot to write
+static int    g_recoilQTail = 0;  // next slot to read
+static DWORD g_lastRumbleTime = 0;
 static CRITICAL_SECTION g_recoilCS;
 
 static void RecoilEnqueue(double peak) {
     EnterCriticalSection(&g_recoilCS);
     int next = (g_recoilQHead + 1) % RECOIL_QUEUE_SIZE;
-    if (next != g_recoilQTail) {
+    if (next != g_recoilQTail) {  // drop if full (shouldn't happen at normal fire rates)
         g_recoilQueue[g_recoilQHead] = peak;
         g_recoilQHead = next;
     }
@@ -97,8 +91,6 @@ static double g_recoilAttack = 0.0;
 static bool   g_recoilFiring = false;
 static DWORD  g_btn1Released = 0;
 static double g_pushDamp = 0.0;
-static volatile float g_rumbleLargePeak = 0.0f;  // undecayed, for sustain check
-static volatile float g_rumbleSmallPeak = 0.0f;
 
 // ── Serial ─────────────────────────────────────────────────────────────────
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
@@ -148,8 +140,7 @@ static DWORD WINAPI SerialReaderThread(LPVOID) {
                 float inS = buf[2] / 255.0f;
                 if (inL > g_rumbleLarge) g_rumbleLarge = inL;
                 if (inS > g_rumbleSmall) g_rumbleSmall = inS;
-                g_rumbleLargePeak = inL;   // ← raw peak, no decay
-                g_rumbleSmallPeak = inS;
+                // Queue each impulse independently - never drop a shot
                 double rawMag = (inL * 1.0 + inS * 0.5);
                 double newRecoil = pow(rawMag, RECOIL_CURVE) * RUMBLE_FORCE_SCALE * FORCE_MAX_N;
                 RecoilEnqueue(newRecoil);
@@ -192,10 +183,7 @@ struct AxisState {
 
     void UpdateVelocity(double pos, double dt) {
         rawVel = (dt > 0.0001) ? (pos - lastPos) / dt : 0.0;
-        // Smooth alpha transition instead of hard switch
-        double targetAlpha = VEL_ALPHA + (0.55 - VEL_ALPHA) *
-            (1.0 - fmin(fabs(rawVel) / 0.05, 1.0));
-        smoothVel += targetAlpha * (rawVel - smoothVel);
+        smoothVel += VEL_ALPHA * (rawVel - smoothVel);
         lastPos = pos;
     }
 
@@ -205,7 +193,7 @@ struct AxisState {
         return o < -1.0 ? -1.0 : (o > 1.0 ? 1.0 : o);
     }
 };
-const double AxisState::VEL_ALPHA = 0.25;
+const double AxisState::VEL_ALPHA = 0.35;
 
 // ── Push zone ─────────────────────────────────────────────────────────────
 struct PushState2D {
@@ -359,12 +347,7 @@ int main() {
                 double sign = v > 0.0 ? 1.0 : -1.0;
                 double scaled = fabs(v) * sens;
                 if (scaled > 1.0) scaled = 1.0;
-                double base = pow(scaled, exp);
-                // Two-stage boost for slow movements
-                double slowness = 1.0 - fmin(fabs(v) / VEL_SLOW_THRESHOLD, 1.0);
-                base += slowness * VEL_SLOW_BOOST * fmin(fabs(v) * sens, 1.0);
-                if (base > 1.0) base = 1.0;
-                return sign * base;
+                return sign * pow(scaled, exp);
             };
             stickX = curve(axY.smoothVel, VEL_SENSITIVITY, VEL_CURVE);
             stickY = curve(axZ.smoothVel, VEL_SENSITIVITY, VEL_CURVE);
@@ -383,36 +366,25 @@ int main() {
 
         if (recoilActive) {
             static DWORD lastImpulseEnd = 0;
-            static const DWORD IMPULSE_GAP_MS = 20;
+            static const DWORD IMPULSE_GAP_MS = 20; // minimum ms between impulses
 
             if (!g_recoilFiring && (now - lastImpulseEnd >= IMPULSE_GAP_MS)) {
                 double nextPeak = 0.0;
                 if (RecoilDequeue(nextPeak)) {
-                    // ── Normal path: impulse arrived via serial packet ─────
                     g_recoilPeak = nextPeak;
                     g_recoilForce = nextPeak;
                     g_recoilAttack = (RECOIL_ATTACK_SEC > 0.0) ? 0.0 : 1.0;
                     g_recoilFiring = true;
                 }
-                else {
-                    // ── Sustain path: use undecayed peak, not the display-decayed rL/rS ──
-                    double sustainMag = (g_rumbleLargePeak * 1.0 + g_rumbleSmallPeak * 0.5);
-                    if (sustainMag >= RUMBLE_SUSTAIN_THRESHOLD) {
-                        nextPeak = pow(sustainMag, RECOIL_CURVE)
-                            * RUMBLE_FORCE_SCALE * FORCE_MAX_N
-                            * RUMBLE_SUSTAIN_SCALE;
-                        g_recoilPeak = nextPeak;
-                        g_recoilForce = nextPeak;
-                        g_recoilAttack = (RECOIL_ATTACK_SEC > 0.0) ? 0.0 : 1.0;
-                        g_recoilFiring = true;
-                        g_lastRumbleTime = now;
-                    }
-                }
             }
-            if (g_recoilFiring && g_recoilForce < 0.05)
+
+            // Record when each impulse ends
+            if (g_recoilFiring && g_recoilForce < 0.05) {
                 lastImpulseEnd = now;
+            }
 
             if (g_recoilFiring) {
+                // Attack phase
                 double envelope = 1.0;
                 if (RECOIL_ATTACK_SEC > 0.0) {
                     g_recoilAttack += dt / RECOIL_ATTACK_SEC;
@@ -428,18 +400,20 @@ int main() {
                         (g_recoilQHead - g_recoilQTail + RECOIL_QUEUE_SIZE) % RECOIL_QUEUE_SIZE);
                 }
 
+                // Decay once attack complete
                 if (g_recoilAttack >= 1.0) {
                     double frameDecay = pow(RECOIL_DECAY, dt * 1000.0);
                     g_recoilForce *= frameDecay;
                     g_recoilPeak *= frameDecay;
                     if (g_recoilForce < 0.05) {
                         g_recoilForce = 0.0;
-                        g_recoilFiring = false;
+                        g_recoilFiring = false;  // ready for next queued shot
                     }
                 }
             }
         }
         else {
+            // Button released and window expired - clear queue and state
             g_recoilForce = 0.0;
             g_recoilPeak = 0.0;
             g_recoilAttack = 0.0;
@@ -448,14 +422,12 @@ int main() {
             while (RecoilDequeue(tmp)) {}
         }
 
+        // Also drain queue if no rumble has arrived for 100ms (weapon empty/stopped)
         if (now - g_lastRumbleTime > 100) {
-            double liveMag = (g_rumbleLarge * 1.0 + g_rumbleSmall * 0.5);
-            if (liveMag < RUMBLE_SUSTAIN_THRESHOLD) {
-                double tmp;
-                while (RecoilDequeue(tmp)) {}
-                g_recoilForce = 0.0;
-                g_recoilFiring = false;
-            }
+            double tmp;
+            while (RecoilDequeue(tmp)) {}
+            g_recoilForce = 0.0;
+            g_recoilFiring = false;
         }
 
         // Normal random rumble when not recoiling
@@ -503,6 +475,7 @@ int main() {
         // ── Status display ─────────────────────────────────────────────────
         hz++;
         if (now - lastStats >= 1000) {
+            // Count pending impulses in queue
             int qcount = (g_recoilQHead - g_recoilQTail + RECOIL_QUEUE_SIZE) % RECOIL_QUEUE_SIZE;
             double r = sqrt(offY * offY + offZ * offZ);
             if (debugMode) {

@@ -1,0 +1,29 @@
+XInput Constant Name		Value (Hex)	Description
+XINPUT_GAMEPAD_DPAD_UP		0x0001		Directional pad up .
+XINPUT_GAMEPAD_DPAD_DOWN	0x0002		Directional pad down .
+XINPUT_GAMEPAD_DPAD_LEFT	0x0004		Directional pad left .
+XINPUT_GAMEPAD_DPAD_RIGHT	0x0008		Directional pad right .
+XINPUT_GAMEPAD_START		0x0010		Start (or Menu) button .
+XINPUT_GAMEPAD_BACK		0x0020		Back (or View) button .
+XINPUT_GAMEPAD_LEFT_THUMB	0x0040		Left thumbstick clicked down .
+XINPUT_GAMEPAD_RIGHT_THUMB	0x0080		Right thumbstick clicked down .
+XINPUT_GAMEPAD_LEFT_SHOULDER	0x0100		Left shoulder (LB) button .
+XINPUT_GAMEPAD_RIGHT_SHOULDER	0x0200		Right shoulder (RB) button .
+XINPUT_GAMEPAD_A		0x1000		A button .
+XINPUT_GAMEPAD_B		0x2000		B button .
+XINPUT_GAMEPAD_X		0x4000		X button .
+XINPUT_GAMEPAD_Y		0x8000		Y button .
+
+R1
+LT
+A
+X
+
+            if (btns&1) g_report.right_trigger = 255;
+            if (btns&2) g_report.left_trigger = 255;
+            if (btns&4) g_report.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+            if (btns&8) g_report.buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+
+C:\Program Files (x86)\Microsoft Visual Studio\2019\Community>C:\Users\andre\.pico-sdk\ninja\v1.12.1\ninja.exe -C C:\Users\andre\source\pico\RumbleRoute\RumbleRoute\build
+ninja: Entering directory `C:\Users\andre\source\pico\RumbleRoute\RumbleRoute\build'
+[2/2] Linking CXX executable RumbleRoute.elf

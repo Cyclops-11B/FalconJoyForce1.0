@@ -1,4 +1,4 @@
-﻿// Falcon - Mouse emulation joystick with Force
+// Falcon - Mouse emulation joystick with Force
 // Novint Falcon -> Pico 2 W (CP2102 serial) -> Xbox 360 controller
 
 #include <windows.h>
@@ -20,17 +20,14 @@ static const int    UPDATE_RATE_MS = 1;
 static const bool   INVERT_X = false;
 static const bool   INVERT_Y = false;
 
-static const double VEL_SENSITIVITY = 5.0; // Higher means more stick travel per handle travel
+static const double VEL_SENSITIVITY = 6.0; // Higher means more stick travel per handle travel
 static const double VEL_DEADZONE = 0.0004; // Set lower to eliminate noise and small movements
-static const double VEL_CURVE = 0.60; // less than 1.0 boosts small motions; 1.0 = linear
-static const double VEL_SLOW_THRESHOLD = 0.06;  // below this = fine zone
-static const double VEL_SLOW_BOOST = 2.5;   // extra multiplier in fine zone
-//Velocity curve Alpha - line 205 - lower number averages out small quick corrections
+static const double VEL_CURVE = 0.65; // less than 1.0 boosts small motions; 1.0 = linear
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
 static const double PUSH_SPEED_BASE = 0.34; // how fast cursor moves when entering push zone
-static const double PUSH_SPEED_MAX = 3.0; // maximum push speed at full tilt
+static const double PUSH_SPEED_MAX = 2.0; // maximum push speed at full tilt
 static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
 
 static const double PUSH_DAMP_COEFF = 0.5; // damping strength on direction reversal (0=none, 1=strong)
@@ -49,11 +46,11 @@ static const double RUMBLE_FORCE_SCALE = 12.0; // overall scale factor of rumbe 
 static const double RECOIL_DECAY = 0.30; // lower = snappier
 static const DWORD  RECOIL_WINDOW_MS = 150; // ms after btn 1 release to still catch trigger recoil
 static const double RECOIL_CURVE = 0.5; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
-static const double RECOIL_AIM_DAMP = 0.55;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
+static const double RECOIL_AIM_DAMP = 0.7;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
 // Attack time: how long (in seconds) recoil ramps from 0 to peak before decaying
 // 0.0 = instant peak (original behavior), 0.02 = 20ms ramp, 0.05 = 50ms ramp
 static const double RECOIL_ATTACK_SEC = 0.0;
-static const DWORD  IMPULSE_GAP_MS = 35;  //Gap between force generation and next force - too small and forces blend, wider for more distinct pushes
+static const DWORD  IMPULSE_GAP_MS = 45;
 
 static const double RUMBLE_SUSTAIN_THRESHOLD = 0.15; // min rumble mag to auto-requeue a sustain impulse
 static const double RUMBLE_SUSTAIN_SCALE = 0.85;     // fraction of current rumble to use as sustain peak
@@ -192,10 +189,7 @@ struct AxisState {
 
     void UpdateVelocity(double pos, double dt) {
         rawVel = (dt > 0.0001) ? (pos - lastPos) / dt : 0.0;
-        // Smooth alpha transition instead of hard switch
-        double targetAlpha = VEL_ALPHA + (0.55 - VEL_ALPHA) *
-            (1.0 - fmin(fabs(rawVel) / 0.05, 1.0));
-        smoothVel += targetAlpha * (rawVel - smoothVel);
+        smoothVel += VEL_ALPHA * (rawVel - smoothVel);
         lastPos = pos;
     }
 
@@ -205,7 +199,7 @@ struct AxisState {
         return o < -1.0 ? -1.0 : (o > 1.0 ? 1.0 : o);
     }
 };
-const double AxisState::VEL_ALPHA = 0.25;
+const double AxisState::VEL_ALPHA = 0.35;
 
 // ── Push zone ─────────────────────────────────────────────────────────────
 struct PushState2D {
@@ -359,12 +353,7 @@ int main() {
                 double sign = v > 0.0 ? 1.0 : -1.0;
                 double scaled = fabs(v) * sens;
                 if (scaled > 1.0) scaled = 1.0;
-                double base = pow(scaled, exp);
-                // Two-stage boost for slow movements
-                double slowness = 1.0 - fmin(fabs(v) / VEL_SLOW_THRESHOLD, 1.0);
-                base += slowness * VEL_SLOW_BOOST * fmin(fabs(v) * sens, 1.0);
-                if (base > 1.0) base = 1.0;
-                return sign * base;
+                return sign * pow(scaled, exp);
             };
             stickX = curve(axY.smoothVel, VEL_SENSITIVITY, VEL_CURVE);
             stickY = curve(axZ.smoothVel, VEL_SENSITIVITY, VEL_CURVE);
