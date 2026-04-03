@@ -63,6 +63,7 @@ static const double RECOIL_DECAY = 0.30; // lower = snappier
 static const DWORD  RECOIL_WINDOW_MS = 150; // ms after btn 1 release to still catch trigger recoil
 static const double RECOIL_CURVE = 0.5; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
 static const double RECOIL_AIM_DAMP = 0.40;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
+static const double RECOIL_VERTICAL = 0.1;  // upward force as fraction of recoil (0=none, 1=equal to X)
 // Attack time: how long (in seconds) recoil ramps from 0 to peak before decaying
 // 0.0 = instant peak (original behavior), 0.02 = 20ms ramp, 0.05 = 50ms ramp
 static const double RECOIL_ATTACK_SEC = 0.0;
@@ -443,7 +444,8 @@ int main() {
                     if (g_recoilAttack > 1.0) g_recoilAttack = 1.0;
                     envelope = g_recoilAttack;
                 }
-                rumX = g_recoilPeak * envelope;
+                rumX = (g_recoilPeak * envelope) *2;
+                rumZ = (g_recoilPeak * envelope * RECOIL_VERTICAL);
                 static DWORD lastPrint = 0;
                 if (now - lastPrint > 50) {
                     lastPrint = now;
