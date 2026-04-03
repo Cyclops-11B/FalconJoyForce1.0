@@ -20,12 +20,22 @@ static const int    UPDATE_RATE_MS = 1;
 static const bool   INVERT_X = false;
 static const bool   INVERT_Y = false;
 
-static const double VEL_SENSITIVITY = 5.0; // Higher means more stick travel per handle travel
-static const double VEL_DEADZONE = 0.0004; // Set lower to eliminate noise and small movements
-static const double VEL_CURVE = 0.60; // less than 1.0 boosts small motions; 1.0 = linear
-static const double VEL_SLOW_THRESHOLD = 0.06;  // below this = fine zone
-static const double VEL_SLOW_BOOST = 2.5;   // extra multiplier in fine zone
+// ──Velocity settings ──────────────────────────────────────────────────────
+static const double VEL_DEADZONE = 0.0004;
+
+// ── Low speed zone (fine corrections) ──────────
+static const double VEL_LOW_SENS = 2.0;   // sensitivity for slow movements
+static const double VEL_LOW_CURVE = 0.5;   // curve for slow zone (lower = more boost)
+
+// ── High speed zone (large sweeps) ──────
+static const double VEL_HIGH_SENS = 20.0;   // sensitivity for fast movements
+static const double VEL_HIGH_CURVE = 1.0;   // curve for fast zone (1.0 = linear)
+
+// ── Blend zone ──────
+static const double VEL_BLEND_LOW = 0.03;  // below this = pure low speed
+static const double VEL_BLEND_HIGH = 0.10;  // above this = pure high speed
 //Velocity curve Alpha - line 205 - lower number averages out small quick corrections
+//Velmag = line 375 - threshold where low speed smoothing occurs. lower if high speed response is sluggish, raise if notchy
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
@@ -39,17 +49,20 @@ static const double PUSH_DAMP_DECAY = 8.0; // how quickly damping fades (higher 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.87; // percentage of work radius where max force is achieved
 static const double FORCE_MAX_N = 7.5; // maximum allowable Force (in N)
-static const double FORCE_DAMPING = 1.0; // cut down on springiness
+static const double FORCE_DAMPING = 3.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.2; // how you ramp to max force. lower = force builds earlier and harder
 
+// ──Ambient Rumble settings ──────────────────────────────────────────────────────
 static const double RUMBLE_LARGE_SCALE = 3.0; // scaling of xbox large rumble signal
 static const double RUMBLE_SMALL_SCALE = 3.0; // scaling of xbox small rumble signal
 static const double RUMBLE_DECAY = 0.35;
 static const double RUMBLE_FORCE_SCALE = 12.0; // overall scale factor of rumbe force
+
+// ──Recoil settings ──────────────────────────────────────────────────────
 static const double RECOIL_DECAY = 0.30; // lower = snappier
 static const DWORD  RECOIL_WINDOW_MS = 150; // ms after btn 1 release to still catch trigger recoil
 static const double RECOIL_CURVE = 0.5; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
-static const double RECOIL_AIM_DAMP = 0.55;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
+static const double RECOIL_AIM_DAMP = 0.40;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
 // Attack time: how long (in seconds) recoil ramps from 0 to peak before decaying
 // 0.0 = instant peak (original behavior), 0.02 = 20ms ramp, 0.05 = 50ms ramp
 static const double RECOIL_ATTACK_SEC = 0.0;
@@ -99,6 +112,9 @@ static DWORD  g_btn1Released = 0;
 static double g_pushDamp = 0.0;
 static volatile float g_rumbleLargePeak = 0.0f;  // undecayed, for sustain check
 static volatile float g_rumbleSmallPeak = 0.0f;
+static double g_stickXSmooth = 0.0;
+static double g_stickYSmooth = 0.0;
+static const double STICK_SMOOTH = 0.3; // lower = smoother, higher = more responsive
 
 // ── Serial ─────────────────────────────────────────────────────────────────
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
@@ -192,10 +208,7 @@ struct AxisState {
 
     void UpdateVelocity(double pos, double dt) {
         rawVel = (dt > 0.0001) ? (pos - lastPos) / dt : 0.0;
-        // Smooth alpha transition instead of hard switch
-        double targetAlpha = VEL_ALPHA + (0.55 - VEL_ALPHA) *
-            (1.0 - fmin(fabs(rawVel) / 0.05, 1.0));
-        smoothVel += targetAlpha * (rawVel - smoothVel);
+        smoothVel += VEL_ALPHA * (rawVel - smoothVel);
         lastPos = pos;
     }
 
@@ -354,20 +367,31 @@ int main() {
         if (g_pushDamp > 1.0) g_pushDamp = 1.0;
 
         if (!inPush) {
-            auto curve = [](double v, double sens, double exp) -> double {
-                if (fabs(v) < VEL_DEADZONE) return 0.0;
-                double sign = v > 0.0 ? 1.0 : -1.0;
+            auto evalZone = [](double v, double sens, double crv) -> double {
                 double scaled = fabs(v) * sens;
                 if (scaled > 1.0) scaled = 1.0;
-                double base = pow(scaled, exp);
-                // Two-stage boost for slow movements
-                double slowness = 1.0 - fmin(fabs(v) / VEL_SLOW_THRESHOLD, 1.0);
-                base += slowness * VEL_SLOW_BOOST * fmin(fabs(v) * sens, 1.0);
-                if (base > 1.0) base = 1.0;
-                return sign * base;
+                return pow(scaled, crv);
             };
-            stickX = curve(axY.smoothVel, VEL_SENSITIVITY, VEL_CURVE);
-            stickY = curve(axZ.smoothVel, VEL_SENSITIVITY, VEL_CURVE);
+
+            auto curve = [&](double v) -> double {
+                if (fabs(v) < VEL_DEADZONE) return 0.0;
+                double sign = v > 0.0 ? 1.0 : -1.0;
+                double speed = fabs(v);
+
+                double lo = evalZone(v, VEL_LOW_SENS, VEL_LOW_CURVE);
+                double hi = evalZone(v, VEL_HIGH_SENS, VEL_HIGH_CURVE);
+
+                // Blend factor: 0 = pure low, 1 = pure high
+                double t = (speed - VEL_BLEND_LOW) / (VEL_BLEND_HIGH - VEL_BLEND_LOW);
+                t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+                // Smooth S-curve blend
+                t = t * t * (3.0 - 2.0 * t);
+
+                return sign * (lo * (1.0 - t) + hi * t);
+            };
+
+            stickX = curve(axY.smoothVel);
+            stickY = curve(axZ.smoothVel);
         }
 
         rumblePhase += dt * 80.0 * 2.0 * 3.14159265;
