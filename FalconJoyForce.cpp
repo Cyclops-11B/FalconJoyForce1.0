@@ -210,6 +210,8 @@ struct AxisState {
     void UpdateVelocity(double pos, double dt) {
         rawVel = (dt > 0.0001) ? (pos - lastPos) / dt : 0.0;
         smoothVel += VEL_ALPHA * (rawVel - smoothVel);
+        if (fabs(rawVel) < VEL_DEADZONE * 2.0 && fabs(smoothVel) < VEL_DEADZONE * 3.0)
+            smoothVel = 0.0;
         lastPos = pos;
     }
 
@@ -219,7 +221,7 @@ struct AxisState {
         return o < -1.0 ? -1.0 : (o > 1.0 ? 1.0 : o);
     }
 };
-const double AxisState::VEL_ALPHA = 0.25;
+const double AxisState::VEL_ALPHA = 0.60;
 
 // ── Push zone ─────────────────────────────────────────────────────────────
 struct PushState2D {
