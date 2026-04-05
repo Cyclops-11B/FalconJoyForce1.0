@@ -22,20 +22,12 @@ static const bool   INVERT_Y = false;
 
 // ──Velocity settings ──────────────────────────────────────────────────────
 static const double VEL_DEADZONE = 0.0004;
-
-// ── Low speed zone (fine corrections) ──────────
-static const double VEL_LOW_SENS = 2.0;   // sensitivity for slow movements
-static const double VEL_LOW_CURVE = 0.5;   // curve for slow zone (lower = more boost)
-
-// ── High speed zone (large sweeps) ──────
-static const double VEL_HIGH_SENS = 20.0;   // sensitivity for fast movements
-static const double VEL_HIGH_CURVE = 1.0;   // curve for fast zone (1.0 = linear)
-
-// ── Blend zone ──────
-static const double VEL_BLEND_LOW = 0.03;  // below this = pure low speed
-static const double VEL_BLEND_HIGH = 0.10;  // above this = pure high speed
-//Velocity curve Alpha - line 205 - lower number averages out small quick corrections
-//Velmag = line 375 - threshold where low speed smoothing occurs. lower if high speed response is sluggish, raise if notchy
+static const double VEL_LOW_SENS = 4.0;  // sensitivity at low speeds
+static const double VEL_LOW_CURVE = 0.45;
+static const double VEL_HIGH_SENS = 9.0; // sensitivity at high speeds
+static const double VEL_HIGH_CURVE = 0.85;
+static const double VEL_BLEND_LOW = 0.02;
+static const double VEL_BLEND_HIGH = 0.10;
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
@@ -199,7 +191,13 @@ struct AxisState {
     double lastPos = 0.0;
     double smoothVel = 0.0;
     double rawVel = 0.0;
-    static const double VEL_ALPHA;
+
+    // Ring buffer
+    static const int VEL_WINDOW = 6;
+    double posHistory[6] = {};
+    double timeHistory[6] = {};
+    int    posIdx = 0;
+    bool   posSeeded = false;
 
     void UpdateReach(double pos) {
         if (pos < absMin) absMin = pos;
@@ -208,10 +206,31 @@ struct AxisState {
     }
 
     void UpdateVelocity(double pos, double dt) {
-        rawVel = (dt > 0.0001) ? (pos - lastPos) / dt : 0.0;
-        smoothVel += VEL_ALPHA * (rawVel - smoothVel);
-        if (fabs(rawVel) < VEL_DEADZONE * 2.0 && fabs(smoothVel) < VEL_DEADZONE * 3.0)
+        if (!posSeeded) {
+            for (int i = 0; i < VEL_WINDOW; i++) {
+                posHistory[i] = pos;
+                timeHistory[i] = dt > 0.0 ? dt : 0.001;
+            }
+            posSeeded = true;
+        }
+
+        posHistory[posIdx] = pos;
+        timeHistory[posIdx] = dt;
+        posIdx = (posIdx + 1) % VEL_WINDOW;
+
+        double oldPos = posHistory[posIdx];
+        double elapsed = 0.0;
+        for (int i = 0; i < VEL_WINDOW; i++) elapsed += timeHistory[i];
+
+        rawVel = (elapsed > 0.0001) ? (pos - oldPos) / elapsed : 0.0;
+
+        // No asymmetry - just light uniform smoothing
+        smoothVel += 0.8 * (rawVel - smoothVel);
+
+        // Snap to zero only when clearly stopped
+        if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE)
             smoothVel = 0.0;
+
         lastPos = pos;
     }
 
@@ -221,7 +240,7 @@ struct AxisState {
         return o < -1.0 ? -1.0 : (o > 1.0 ? 1.0 : o);
     }
 };
-const double AxisState::VEL_ALPHA = 0.60;
+//const double AxisState::VEL_ALPHA = 0.25; // unused but kept to avoid linker error
 
 // ── Push zone ─────────────────────────────────────────────────────────────
 struct PushState2D {
@@ -547,8 +566,8 @@ int main() {
                 col = col < 0 ? 0 : (col > 8 ? 8 : col);
                 printf("\r%4d Hz  r=%.2f %s  damp=%.2f  [", hz, r, inPush ? "PUSH" : "    ", g_pushDamp);
                 for (int c = 0; c <= 8; c++) printf(c == col ? "O" : ".");
-                printf("]  stk=(%.2f,%.2f)  rbl=%.2f/%.2f  rcl=%.2f  q=%d  btn=%X   ",
-                    stickX, stickY, rL, rS, g_recoilForce, qcount, btnMask);
+                printf("]  stk=(%.2f,%.2f)  vel=%.3f/%.3f  rbl=%.2f/%.2f  rcl=%.2f  q=%d  btn=%X   ",
+                    stickX, stickY, axY.smoothVel, axZ.smoothVel, rL, rS, g_recoilForce, qcount, btnMask);
                 fflush(stdout);
             }
             hz = 0; lastStats = now;
