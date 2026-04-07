@@ -22,24 +22,25 @@ static const bool   INVERT_Y = false;
 
 // ──Velocity settings ──────────────────────────────────────────────────────
 static const double VEL_DEADZONE = 0.0004;
-static const double VEL_LOW_SENS = 4.0;  // sensitivity at low speeds
-static const double VEL_LOW_CURVE = 0.45;
-static const double VEL_HIGH_SENS = 9.0; // sensitivity at high speeds
-static const double VEL_HIGH_CURVE = 0.85;
-static const double VEL_BLEND_LOW = 0.02;
-static const double VEL_BLEND_HIGH = 0.10;
+static const double VEL_LOW_SENS = 3.0;  // sensitivity at low speeds
+static const double VEL_LOW_CURVE = 0.45; // curve for slow zone (lower = more boost)
+static const double VEL_HIGH_SENS = 12.0; // sensitivity at high speeds
+static const double VEL_HIGH_CURVE = 0.85; // curve for fast zone (1.0 = linear)
+static const double VEL_BLEND_LOW = 0.02; // below this = pure low speed
+static const double VEL_BLEND_HIGH = 0.10; // above this = pure high speed
+static const double VEL_ALPHA = 0.7;  // 0.8 = very responsive, lower = smoother
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
 static const double PUSH_SPEED_BASE = 0.34; // how fast cursor moves when entering push zone
-static const double PUSH_SPEED_MAX = 3.0; // maximum push speed at full tilt
+static const double PUSH_SPEED_MAX = 4.0; // maximum push speed at full tilt
 static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
 
-static const double PUSH_DAMP_COEFF = 0.5; // damping strength on direction reversal (0=none, 1=strong)
-static const double PUSH_DAMP_DECAY = 8.0; // how quickly damping fades (higher = faster)
+static const double PUSH_DAMP_COEFF = 0.7; // damping strength on direction reversal (0=none, 1=strong)
+static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
-static const double FORCE_MAX_RAD = 0.87; // percentage of work radius where max force is achieved
+static const double FORCE_MAX_RAD = 0.84; // percentage of work radius where max force is achieved
 static const double FORCE_MAX_N = 7.5; // maximum allowable Force (in N)
 static const double FORCE_DAMPING = 3.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.2; // how you ramp to max force. lower = force builds earlier and harder
@@ -193,7 +194,7 @@ struct AxisState {
     double rawVel = 0.0;
 
     // Ring buffer
-    static const int VEL_WINDOW = 6;
+    static const int VEL_WINDOW = 3;
     double posHistory[6] = {};
     double timeHistory[6] = {};
     int    posIdx = 0;
@@ -222,10 +223,16 @@ struct AxisState {
         double elapsed = 0.0;
         for (int i = 0; i < VEL_WINDOW; i++) elapsed += timeHistory[i];
 
-        rawVel = (elapsed > 0.0001) ? (pos - oldPos) / elapsed : 0.0;
-
-        // No asymmetry - just light uniform smoothing
-        smoothVel += 0.8 * (rawVel - smoothVel);
+        rawVel = 0.0;
+        int prev = (posIdx + VEL_WINDOW - 1) % VEL_WINDOW;
+        for (int i = 0; i < VEL_WINDOW - 1; i++) {
+            int cur = (posIdx + VEL_WINDOW - 1 - i) % VEL_WINDOW;
+            int prv = (posIdx + VEL_WINDOW - 2 - i) % VEL_WINDOW;
+            double t = timeHistory[cur] > 0.0001 ? timeHistory[cur] : 0.001;
+            double v = (posHistory[cur] - posHistory[prv]) / t;
+            if (fabs(v) > fabs(rawVel)) rawVel = v;
+        }
+        smoothVel += VEL_ALPHA * (rawVel - smoothVel);
 
         // Snap to zero only when clearly stopped
         if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE)
