@@ -25,22 +25,26 @@ static const double VEL_DEADZONE = 0.0004;
 static const double VEL_LOW_SENS = 3.0;  // sensitivity at low speeds
 static const double VEL_LOW_CURVE = 0.45; // curve for slow zone (lower = more boost)
 static const double VEL_HIGH_SENS = 12.0; // sensitivity at high speeds
-static const double VEL_HIGH_CURVE = 0.85; // curve for fast zone (1.0 = linear)
+static const double VEL_HIGH_CURVE = 0.65; // curve for fast zone (1.0 = linear)
 static const double VEL_BLEND_LOW = 0.02; // below this = pure low speed
 static const double VEL_BLEND_HIGH = 0.10; // above this = pure high speed
-static const double VEL_ALPHA = 0.7;  // 0.8 = very responsive, lower = smoother
+static const double VEL_ALPHA = 0.6;  // 0.8 = very responsive, lower = smoother
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
-static const double PUSH_SPEED_BASE = 0.34; // how fast cursor moves when entering push zone
-static const double PUSH_SPEED_MAX = 4.0; // maximum push speed at full tilt
+static const double PUSH_SPEED_BASE = 0.44; // how fast cursor moves when entering push zone
+static const double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
 static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
 
 static const double PUSH_DAMP_COEFF = 0.7; // damping strength on direction reversal (0=none, 1=strong)
 static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
 
+static const double FRICTION_CANCEL = 0.4;    // feed forward force in Newtons
+static const double FRICTION_VEL_MIN = 0.003;  // velocity where feed forward starts fading in
+static const double FRICTION_VEL_MAX = 0.08;   // velocity where feed forward finishes fading out
+
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
-static const double FORCE_MAX_RAD = 0.84; // percentage of work radius where max force is achieved
+static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
 static const double FORCE_MAX_N = 7.5; // maximum allowable Force (in N)
 static const double FORCE_DAMPING = 3.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.2; // how you ramp to max force. lower = force builds earlier and harder
@@ -315,6 +319,23 @@ static void ApplyForces(double y, double z,
         double s = 7.8 / totalMag;
         rumX *= s; forceY *= s; forceZ *= s;
     }
+
+    // Active friction cancellation - fades in above min threshold, fades out above max
+    static const double FRICTION_VEL_MIN = 0.003;  // below this = no cancellation
+    static const double FRICTION_VEL_MAX = 0.08;   // above this = no cancellation
+    double velMag = sqrt(velY * velY + velZ * velZ);
+    if (velMag > FRICTION_VEL_MIN) {
+        // Fade in from min threshold
+        double fadeIn = fmin((velMag - FRICTION_VEL_MIN) / (FRICTION_VEL_MIN * 3.0), 1.0);
+        // Fade out toward max threshold
+        double fadeOut = fmax(1.0 - (velMag - FRICTION_VEL_MIN) / (FRICTION_VEL_MAX - FRICTION_VEL_MIN), 0.0);
+        double blend = fadeIn * fadeOut;
+        double fCancelY = (velY / velMag) * FRICTION_CANCEL * blend;
+        double fCancelZ = (velZ / velMag) * FRICTION_CANCEL * blend;
+        forceY += fCancelY;
+        forceZ += fCancelZ;
+    }
+
     dhdSetForce(rumX, forceY, forceZ);
 }
 
