@@ -17,8 +17,14 @@ Step 5: Clone this repository and input that COM# line into the configuration. C
 Startup and go
 
 
+
+
 Troubleshooting:
 
-If the program reports that the Falcon can't be found, test the Force Dimension programs that come with the SDK. If they can't open the Falcon either, perform the steps they recommend here:
+If the program reports that the Falcon can't be found, test the Force Dimension programs that come with the SDK. If they can't open the Falcon either, perform the steps FD recommends:
+
+In Device Manager, find your haptics device and right-click on it and open Properities. Then select from the menu Update driver>Browse my computer for driver software and specify the drivers listed under C:\Program Files\ForceDimension\sdk-X.X.X\drivers\usb. Try restarting if drivers are not detected or changes do not take place.
+
+Source:
 https://forcedimension-core-python-docs.readthedocs.io/en/v1.0.0/installation.html#windows
 
