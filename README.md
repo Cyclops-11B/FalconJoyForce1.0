@@ -11,7 +11,14 @@ Step 3: Install the Force Dimension SDK and the driver for the CP2102.
 
 Step 4: Find the CP2102 in your device manager and note what COM line it is running on (COM4, COM,6, etc)
 
-Step 5: Clone this repository and input that COM# line into the configuration. 
+Step 5: Clone this repository and input that COM# line into the configuration. Copy dhd64.DLL from the Force Dimension directory to the working directory.
 
 
 Startup and go
+
+
+Troubleshooting:
+
+If the program reports that the Falcon can't be found, test the Force Dimension programs that come with the SDK. If they can't open the Falcon either, perform the steps they recommend here:
+https://forcedimension-core-python-docs.readthedocs.io/en/v1.0.0/installation.html#windows
+
