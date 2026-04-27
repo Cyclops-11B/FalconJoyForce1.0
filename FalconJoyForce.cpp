@@ -27,8 +27,8 @@ static const double VEL_LOW_CURVE = 0.45; // curve for slow zone (lower = more b
 static const double VEL_HIGH_SENS = 12.0; // sensitivity at high speeds
 static const double VEL_HIGH_CURVE = 0.65; // curve for fast zone (1.0 = linear)
 static const double VEL_BLEND_LOW = 0.02; // below this = pure low speed
-static const double VEL_BLEND_HIGH = 0.10; // above this = pure high speed
-static const double VEL_ALPHA = 0.6;  // 0.8 = very responsive, lower = smoother
+static const double VEL_BLEND_HIGH = 0.08; // above this = pure high speed
+static const double VEL_ALPHA = 0.7;  // 0.8 = very responsive, lower = smoother
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
@@ -40,27 +40,29 @@ static const double PUSH_DAMP_COEFF = 0.7; // damping strength on direction reve
 static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
 
 static const double FRICTION_CANCEL = 0.4;    // feed forward force in Newtons
-static const double FRICTION_VEL_MIN = 0.003;  // velocity where feed forward starts fading in
+static const double FRICTION_VEL_MIN = 0.001;  // velocity where feed forward starts fading in
 static const double FRICTION_VEL_MAX = 0.08;   // velocity where feed forward finishes fading out
 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
 static const double FORCE_MAX_N = 7.5; // maximum allowable Force (in N)
 static const double FORCE_DAMPING = 3.0; // cut down on springiness
-static const double FORCE_EXPONENT = 2.2; // how you ramp to max force. lower = force builds earlier and harder
+static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
-static const double RUMBLE_LARGE_SCALE = 3.0; // scaling of xbox large rumble signal
-static const double RUMBLE_SMALL_SCALE = 3.0; // scaling of xbox small rumble signal
-static const double RUMBLE_DECAY = 0.35;
-static const double RUMBLE_FORCE_SCALE = 12.0; // overall scale factor of rumbe force
+static const double AMBIENT_LARGE_SCALE = 1.0;  // random rumble force scale
+static const double AMBIENT_SMALL_SCALE = 1.0;  // random rumble force scale
+static const double RUMBLE_DECAY = 0.25;
+static const double RUMBLE_FORCE_SCALE = 14.0; // overall scale factor of rumble force
 
 // ──Recoil settings ──────────────────────────────────────────────────────
-static const double RECOIL_DECAY = 0.30; // lower = snappier
-static const DWORD  RECOIL_WINDOW_MS = 150; // ms after btn 1 release to still catch trigger recoil
-static const double RECOIL_CURVE = 0.5; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
+static const double RUMBLE_LARGE_SCALE = 5.0; // scaling of xbox large rumble signal
+static const double RUMBLE_SMALL_SCALE = 5.0; // scaling of xbox small rumble signal
+static const double RECOIL_DECAY = 0.2; // lower = snappier
+static const DWORD  RECOIL_WINDOW_MS = 250; // ms after btn 1 release to still catch trigger recoil
+static const double RECOIL_CURVE = 0.60; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
 static const double RECOIL_AIM_DAMP = 0.40;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
-static const double RECOIL_VERTICAL = 0.1;  // upward force as fraction of recoil (0=none, 1=equal to X)
+static const double RECOIL_VERTICAL = 0.3;  // upward force as fraction of recoil (0=none, 1=equal to X)
 // Attack time: how long (in seconds) recoil ramps from 0 to peak before decaying
 // 0.0 = instant peak (original behavior), 0.02 = 20ms ramp, 0.05 = 50ms ramp
 static const double RECOIL_ATTACK_SEC = 0.0;
@@ -165,6 +167,11 @@ static DWORD WINAPI SerialReaderThread(LPVOID) {
                 g_rumbleLargePeak = inL;   // ← raw peak, no decay
                 g_rumbleSmallPeak = inS;
                 double rawMag = (inL * 1.0 + inS * 0.5);
+                static DWORD lastRawPrint = 0;
+                if (GetTickCount() - lastRawPrint > 100) {
+                    lastRawPrint = GetTickCount();
+                    printf("\nRAW: L=%.3f S=%.3f mag=%.3f\n", inL, inS, rawMag);
+                }
                 double newRecoil = pow(rawMag, RECOIL_CURVE) * RUMBLE_FORCE_SCALE * FORCE_MAX_N;
                 RecoilEnqueue(newRecoil);
                 g_lastRumbleTime = GetTickCount();
@@ -469,9 +476,10 @@ int main() {
                     g_recoilFiring = true;
                 }
                 else {
-                    // ── Sustain path: use undecayed peak, not the display-decayed rL/rS ──
+                    // ── Sustain path: generate rhythmic impulses while rumble present ──
                     double sustainMag = (g_rumbleLargePeak * 1.0 + g_rumbleSmallPeak * 0.5);
-                    if (sustainMag >= RUMBLE_SUSTAIN_THRESHOLD) {
+                    if (sustainMag >= RUMBLE_SUSTAIN_THRESHOLD
+                        && (now - lastImpulseEnd >= IMPULSE_GAP_MS)) {
                         nextPeak = pow(sustainMag, RECOIL_CURVE)
                             * RUMBLE_FORCE_SCALE * FORCE_MAX_N
                             * RUMBLE_SUSTAIN_SCALE;
@@ -538,7 +546,7 @@ int main() {
             static double rumDirY = 1.0, rumDirZ = 0.0, rumDirX = 0.0;
             static DWORD  lastDirChange = 0;
             static const DWORD DIR_CHANGE_MS = 40;
-            double mag = (rL * RUMBLE_LARGE_SCALE + rS * RUMBLE_SMALL_SCALE);
+            double mag = (rL * AMBIENT_LARGE_SCALE + rS * AMBIENT_SMALL_SCALE);
             if (mag > 0.01) {
                 if (now - lastDirChange > DIR_CHANGE_MS) {
                     lastDirChange = now;
