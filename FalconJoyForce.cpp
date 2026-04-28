@@ -41,7 +41,7 @@ static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher 
 
 static const double FRICTION_CANCEL = 0.4;    // feed forward force in Newtons
 static const double FRICTION_VEL_MIN = 0.001;  // velocity where feed forward starts fading in
-static const double FRICTION_VEL_MAX = 0.08;   // velocity where feed forward finishes fading out
+static const double FRICTION_VEL_MAX = 0.06;   // velocity where feed forward finishes fading out
 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
@@ -61,8 +61,11 @@ static const double RUMBLE_SMALL_SCALE = 5.0; // scaling of xbox small rumble si
 static const double RECOIL_DECAY = 0.2; // lower = snappier
 static const DWORD  RECOIL_WINDOW_MS = 250; // ms after btn 1 release to still catch trigger recoil
 static const double RECOIL_CURVE = 0.60; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
-static const double RECOIL_AIM_DAMP = 0.40;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
+static const double RECOIL_AIM_DAMP = 0.50;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
 static const double RECOIL_VERTICAL = 0.3;  // upward force as fraction of recoil (0=none, 1=equal to X)
+static const double RECOIL_DAMP_ATTACK_MS = 80.0;   // ms of full damping at start of each impulse
+static const double RECOIL_DAMP_DECAY_RATE = 6.0;    // how fast damping fades after attack (higher = faster)
+
 // Attack time: how long (in seconds) recoil ramps from 0 to peak before decaying
 // 0.0 = instant peak (original behavior), 0.02 = 20ms ramp, 0.05 = 50ms ramp
 static const double RECOIL_ATTACK_SEC = 0.0;
@@ -115,6 +118,7 @@ static volatile float g_rumbleSmallPeak = 0.0f;
 static double g_stickXSmooth = 0.0;
 static double g_stickYSmooth = 0.0;
 static const double STICK_SMOOTH = 0.3; // lower = smoother, higher = more responsive
+static double g_recoilDampEnv = 0.0;  // current aim damp envelope (0-1)
 
 // ── Serial ─────────────────────────────────────────────────────────────────
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
@@ -227,27 +231,45 @@ struct AxisState {
         }
 
         posHistory[posIdx] = pos;
-        timeHistory[posIdx] = dt;
+        timeHistory[posIdx] = dt > 0.0 ? dt : 0.001;
         posIdx = (posIdx + 1) % VEL_WINDOW;
 
+        // Average velocity over full window (stable at low speed)
         double oldPos = posHistory[posIdx];
         double elapsed = 0.0;
         for (int i = 0; i < VEL_WINDOW; i++) elapsed += timeHistory[i];
+        double avgVel = (elapsed > 0.0001) ? (pos - oldPos) / elapsed : 0.0;
 
-        rawVel = 0.0;
-        int prev = (posIdx + VEL_WINDOW - 1) % VEL_WINDOW;
+        // Peak velocity in window (responsive at high speed)
+        double peakVel = 0.0;
         for (int i = 0; i < VEL_WINDOW - 1; i++) {
             int cur = (posIdx + VEL_WINDOW - 1 - i) % VEL_WINDOW;
             int prv = (posIdx + VEL_WINDOW - 2 - i) % VEL_WINDOW;
             double t = timeHistory[cur] > 0.0001 ? timeHistory[cur] : 0.001;
             double v = (posHistory[cur] - posHistory[prv]) / t;
-            if (fabs(v) > fabs(rawVel)) rawVel = v;
+            if (fabs(v) > fabs(peakVel)) peakVel = v;
         }
+
+        // Blend: slow = use average (smooth), fast = use peak (responsive)
+        static const double BLEND_LOW = 0.02;
+        static const double BLEND_HIGH = 0.10;
+        double speed = fabs(avgVel);
+        double t = (speed - BLEND_LOW) / (BLEND_HIGH - BLEND_LOW);
+        t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+        t = t * t * (3.0 - 2.0 * t);  // S-curve
+        rawVel = avgVel * (1.0 - t) + peakVel * t;
+
         smoothVel += VEL_ALPHA * (rawVel - smoothVel);
 
-        // Snap to zero only when clearly stopped
-        if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE)
-            smoothVel = 0.0;
+        // Hysteresis snap-to-zero - needs to be clearly stopped, not just briefly slow
+        static int zeroCount = 0;
+        if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE * 1.5) {
+            zeroCount++;
+            if (zeroCount > 8) smoothVel = 0.0;  // only zero after 8 consecutive quiet frames
+        }
+        else {
+            zeroCount = 0;
+        }
 
         lastPos = pos;
     }
@@ -458,7 +480,13 @@ int main() {
         bool btn1held = (dhdGetButton(0) > 0);
         if (btn1WasHeld && !btn1held) g_btn1Released = now;
         btn1WasHeld = btn1held;
+        static bool wasRecoilActive = false;
         bool recoilActive = btn1held || (now - g_btn1Released < RECOIL_WINDOW_MS);
+
+        // Only trigger damp envelope on first press, not on each impulse
+        if (recoilActive && !wasRecoilActive)
+            g_recoilDampEnv = 1.0;
+        wasRecoilActive = recoilActive;
 
         double rumX = 0.0, rumY = 0.0, rumZ = 0.0;
 
@@ -576,7 +604,7 @@ int main() {
         // ── Send controller packet ─────────────────────────────────────────
         double stickScale = 1.0 - g_pushDamp;
         if (stickScale < 0.0) stickScale = 0.0;
-        if (recoilActive && g_recoilFiring)
+        if (recoilActive)
             stickScale *= RECOIL_AIM_DAMP;
 
         int16_t lx = ToStick(stickX * stickScale * (INVERT_X ? -1.0 : 1.0));
