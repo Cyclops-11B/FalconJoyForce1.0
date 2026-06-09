@@ -74,7 +74,7 @@ static const double FORCE_DAMPING = 1.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
 //Gravity Compensation ────────────────────────────────────────────────────────────
-static const double GRAVITY_COMP_SCALE = 1.95;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
+static const double GRAVITY_COMP_SCALE = 2.05;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
 static const double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
