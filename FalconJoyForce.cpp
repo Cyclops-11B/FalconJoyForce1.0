@@ -19,7 +19,7 @@ static const BYTE PACKET_IN_MAGIC = 0xAA;
 static const BYTE PACKET_OUT_MAGIC = 0xBB;
 
 // ── Controller config ──────────────────────────────────────────────────────
-static const int UPDATE_RATE_MS = 3;  // 8 = ~125Hz, within Falcon's range
+static const int UPDATE_RATE_MS = .25;  // 8 = ~125Hz, within Falcon's range
 static const bool   INVERT_X = false;
 static const bool   INVERT_Y = false;
 
@@ -45,20 +45,36 @@ static const double PUSH_SPEED_BASE = 0.44; // how fast cursor moves when enteri
 static const double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
 static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
 
+static const double VEL_FC_SPEED_CEIL = 0.06; // velocity ceiling for top smoothing bracket (m/s) — NOT the work area
+static const double CALIB_FILL = 0.95;        // fraction of measured reach that maps to full deflection
+static const double CALIB_MIN = 0.025;       // reject implausibly small sweeps (m)
+static const double CALIB_MAX = 0.120;       // reject implausibly large sweeps (m)
+
 static const double PUSH_DAMP_COEFF = 0.9; // damping strength on direction reversal (0=none, 1=strong)
 static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
 
-static const double FRICTION_CANCEL = .2;    // feed forward force in Newtons
-static const double FRICTION_VEL_MIN = 0.0002;  // velocity where feed forward starts fading in
-static const double FRICTION_VEL_MAX = 0.02;   // velocity where feed forward finishes fading out
+//Feed forward variables ────────────────────────────────────────────────────────
+static const double FRICTION_CANCEL = .14;    // feed forward force in Newtons
+static const double FRICTION_VEL_MIN = 0.0006; // engage almost as soon as motion starts
+static const double FRICTION_VEL_FULL = 0.004;  // assist reaches full here (fixed window, not tied to MIN)
+static const double FRICTION_VEL_MAX = 0.08;   // faded back out by here
 
-static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
+static const double STICTION_BREAK_N = 0.09;   // constant breakaway force (N)
+static const double STICTION_VEL_ON = 0.0005; // motion floor (= your SHORT_VEL_NOISE)
+
+// ── Button 2 brace / preload ─────────────────────────────────────────────────
+static const double BTN2_X_FORCE = 0.9;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
+static const double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
+
+//Spring box ─────────────────────────────────────────────────────────────────────
+static const double FORCE_SPRING_START = 0.5; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
 static const double FORCE_MAX_N = 8; // maximum allowable Force (in N)
-static const double FORCE_DAMPING = 3.0; // cut down on springiness
+static const double FORCE_DAMPING = 1.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
-static const double GRAVITY_COMP_SCALE = 2.3;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
+//Gravity Compensation ────────────────────────────────────────────────────────────
+static const double GRAVITY_COMP_SCALE = 1.95;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
 static const double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
@@ -309,7 +325,7 @@ struct AxisState {
             fc = 18.0 + (30.0 - 18.0) * t;  // was 8->15
         }
         else {
-            double t = (velSpeed - VEL_BLEND_HIGH) / (HALF_RANGE_MAX - VEL_BLEND_HIGH);
+            double t = (velSpeed - VEL_BLEND_HIGH) / (VEL_FC_SPEED_CEIL - VEL_BLEND_HIGH);
             t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
             fc = 30.0 + (55.0 - 30.0) * t;  // was 15->30
         }
@@ -439,11 +455,17 @@ static void ApplyForces(double y, double z,
     static const double FRICTION_VEL_MAX = 0.08;
     double velMag = sqrt(velY * velY + velZ * velZ);
     if (velMag > FRICTION_VEL_MIN) {
-        double fadeIn = fmin((velMag - FRICTION_VEL_MIN) / (FRICTION_VEL_MIN * 3.0), 1.0);
-        double fadeOut = fmax(1.0 - (velMag - FRICTION_VEL_MIN) / (FRICTION_VEL_MAX - FRICTION_VEL_MIN), 0.0);
+        double fadeIn = fmin((velMag - FRICTION_VEL_MIN) / (FRICTION_VEL_FULL - FRICTION_VEL_MIN), 1.0);
+        double fadeOut = fmax(1.0 - (velMag - FRICTION_VEL_FULL) / (FRICTION_VEL_MAX - FRICTION_VEL_FULL), 0.0);
         double blend = fadeIn * fadeOut;
         forceY += (velY / velMag) * FRICTION_CANCEL * blend;
         forceZ += (velZ / velMag) * FRICTION_CANCEL * blend;
+    }
+
+    //Coulomb breakaway
+    if (velMag > STICTION_VEL_ON) {
+        forceY += (velY / velMag) * STICTION_BREAK_N;
+        forceZ += (velZ / velMag) * STICTION_BREAK_N;
     }
 
     // Cap X and YZ independently
@@ -748,6 +770,9 @@ int main() {
         g_rumbleLarge = rL * (float)RUMBLE_DECAY;
         g_rumbleSmall = rS * (float)RUMBLE_DECAY;
 
+        // ── Button 2: constant X preload to ease small corrections ───────────────────
+        if (dhdGetButton(1) > 0) rumX += BTN2_X_SIGN * BTN2_X_FORCE;
+
         ApplyForces(y, z, axY, axZ, axY.smoothVel, axZ.smoothVel, rumX, rumY, rumZ);
 
 
@@ -799,19 +824,23 @@ int main() {
             Sleep(200);
         }
         if (GetAsyncKeyState(VK_F11) & 0x8000) {
-            printf("\nRecalibrating - move to all extremes for 4 seconds...\n");
+            printf("\nRecalibrating - move to ALL extremes for 4 seconds...\n");
             axY = {}; axZ = {};
             DWORD t1 = GetTickCount();
             while (GetTickCount() - t1 < 4000) {
                 double rx, ry, rz;
-                if (dhdGetPosition(&rx, &ry, &rz) >= 0) {
-                    axY.UpdateReach(ry);
-                    axZ.UpdateReach(rz);
-                }
+                if (dhdGetPosition(&rx, &ry, &rz) >= 0) { axY.UpdateReach(ry); axZ.UpdateReach(rz); }
                 Sleep(1);
             }
-            printf("Done. Y ctr=%.4f half=%.4f  Z ctr=%.4f half=%.4f\n",
-                axY.estCenter, axY.halfRange, axZ.estCenter, axZ.halfRange);
+            double rawHalfY = (axY.absMax - axY.absMin) * 0.5;
+            double rawHalfZ = (axZ.absMax - axZ.absMin) * 0.5;
+            double fitY = rawHalfY * CALIB_FILL, fitZ = rawHalfZ * CALIB_FILL;
+            if (fitY >= CALIB_MIN && fitY <= CALIB_MAX) axY.halfRange = fitY;  // guard against a partial sweep
+            if (fitZ >= CALIB_MIN && fitZ <= CALIB_MAX) axZ.halfRange = fitZ;
+            double recommend = (axY.halfRange < axZ.halfRange) ? axY.halfRange : axZ.halfRange;
+            printf("Measured half-extent:  Y=%.4f m  Z=%.4f m\n", rawHalfY, rawHalfZ);
+            printf("Work area now:  Y half=%.4f  Z half=%.4f\n", axY.halfRange, axZ.halfRange);
+            printf(">> Permanent fit: set HALF_RANGE_MAX = %.4f\n", recommend);
             Sleep(200);
         }
         Sleep(UPDATE_RATE_MS);
