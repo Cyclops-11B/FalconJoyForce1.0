@@ -38,32 +38,41 @@ static const double SOFT_RAMP = 0.004;  // m/s width of ramp zone
 static const double SHORT_VEL_NOISE = 0.0005;  // higher suppresses more low-speed noise
 static const double VEL_VLOW_POS_SCALE = 7.0;  // position error scale
 double posBlendMax = VEL_BLEND_LOW * 2.0;
-static const double VEL_RELEASE_MULT = 5.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
+static const double VEL_RELEASE_MULT = 8.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
 
+// Flick capture: bank fast motion the saturated stick can't express, pay it out as a short tail ──
+static const double FLICK_VEL_ON = 0.02;   // m/s above which motion is treated as a flick and banked (≈ where the stick saturates)
+static const double FLICK_GAIN = 4.0;    // how much banked over-speed becomes extra deflection
+static const double FLICK_DECAY = 0.92;   // per-ms decay of the carry tail — lower = shorter tail
+static const double FLICK_CARRY_MAX = 0.9;    // clamp on carry deflection so big flicks don't over-throw
+
+// Push zone variables
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
 static const double PUSH_SPEED_BASE = 0.44; // how fast cursor moves when entering push zone
 static const double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
 static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
 
+// Velocity zone stuff
 static const double VEL_FC_SPEED_CEIL = 0.06; // velocity ceiling for top smoothing bracket (m/s) — NOT the work area
 static const double CALIB_FILL = 0.95;        // fraction of measured reach that maps to full deflection
 static const double CALIB_MIN = 0.025;       // reject implausibly small sweeps (m)
 static const double CALIB_MAX = 0.120;       // reject implausibly large sweeps (m)
 
+// Push zone re-entry damping
 static const double PUSH_DAMP_COEFF = 0.9; // damping strength on direction reversal (0=none, 1=strong)
 static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
 
 // ── Boundary detent: a ridge you push over right before the push zone ─────────
 static const double DETENT_WIDTH = 0.12; // fraction of work radius over which the ridge builds
-static const double DETENT_PEAK_N = 1.3;  // ridge height in N — resistance grows, then releases at threshold
+static const double DETENT_PEAK_N = 1.6;  // ridge height in N — resistance grows, then releases at threshold
 static const double DETENT_VEL_HYST = 0.003; // m/s direction threshold — detent arms moving out, suppresses moving back in
 
 // ── Exit pump: a brief inward kick right at the border when leaving the push zone ──
 static const double PUMP_PEAK_N = 1.3;  // kick strength (N) as you cross back out of push
 static const double PUMP_DECAY = 0.90;  // per-ms decay of the kick — lower = snappier/shorter pump
 
-//Feed forward variables ────────────────────────────────────────────────────────
+//  Feed forward variables ────────────────────────────────────────────────────────
 static const double FRICTION_CANCEL = .14;    // feed forward force in Newtons
 static const double FRICTION_VEL_MIN = 0.0006; // engage almost as soon as motion starts
 static const double FRICTION_VEL_FULL = 0.004;  // assist reaches full here (fixed window, not tied to MIN)
@@ -76,14 +85,14 @@ static const double STICTION_VEL_ON = 0.0005; // motion floor (= your SHORT_VEL_
 static const double BTN2_X_FORCE = 0.9;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
 static const double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
 
-//Spring box ─────────────────────────────────────────────────────────────────────
+//  Spring box ─────────────────────────────────────────────────────────────────────
 static const double FORCE_SPRING_START = 0.5; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
 static const double FORCE_MAX_N = 8; // maximum allowable Force (in N)
 static const double FORCE_DAMPING = 1.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
-//Gravity Compensation ────────────────────────────────────────────────────────────
+//  Gravity Compensation ────────────────────────────────────────────────────────────
 static const double GRAVITY_COMP_SCALE = 2.05;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
@@ -262,6 +271,7 @@ struct AxisState {
     double lastPos = 0.0;
     double smoothVel = 0.0;
     double rawVel = 0.0;
+    double flickCarry = 0.0;   // banked fast-motion deflection, paid out as a tail
     int    zeroCount = 0;
     double slowRef = 0.0;
     bool   slowRefSeeded = false;
@@ -353,6 +363,24 @@ struct AxisState {
         }
 
         lastPos = pos;
+    }
+
+    // ── Flick capture ────────────────────────────────────────────────────────
+    // When the hand moves faster than the stick can express (saturation), bank the
+    // over-speed and pay it back as a brief decaying carry, so a quick flick delivers
+    // the rotation its displacement deserves. Below the threshold nothing banks, so
+    // slow aiming and snappy stops are untouched. A reversal cancels pending carry.
+    void UpdateFlick(double dt) {
+        double sp = fabs(smoothVel);
+        double excess = sp - FLICK_VEL_ON;
+        if (excess < 0.0) excess = 0.0;
+        double target = (smoothVel >= 0.0 ? 1.0 : -1.0) * excess * FLICK_GAIN;
+        if (sp > FLICK_VEL_ON && target * flickCarry < 0.0) flickCarry = 0.0; // flicked the other way → cancel
+        if (fabs(target) > fabs(flickCarry)) flickCarry = target;            // fast attack: capture the peak
+        else flickCarry *= pow(FLICK_DECAY, dt * 1000.0);                    // slow release: pay out the tail
+        if (flickCarry > FLICK_CARRY_MAX) flickCarry = FLICK_CARRY_MAX;
+        if (flickCarry < -FLICK_CARRY_MAX) flickCarry = -FLICK_CARRY_MAX;
+        if (fabs(flickCarry) < 0.001) flickCarry = 0.0;
     }
 
     double Offset(double pos) const {
@@ -641,6 +669,9 @@ int main() {
             axZ.smoothVel *= bleedZ;
         }
 
+        axY.UpdateFlick(dt);   // bank/pay-out fast-motion carry (uses post-bleed velocity)
+        axZ.UpdateFlick(dt);
+
         if (!inPush) {
             auto evalZone = [](double v, double sens, double crv) -> double {
                 double scaled = fabs(v) * sens;
@@ -692,6 +723,9 @@ int main() {
                 stickX = stickX * (1.0 - posBlend) + pcX * posBlend;
                 stickY = stickY * (1.0 - posBlend) + pcY * posBlend;
             }
+
+            stickX += axY.flickCarry;   // pay out banked fast-motion as a short carry tail
+            stickY += axZ.flickCarry;   // (ToStick clamps the sum to ±1)
         }
 
         rumblePhase += dt * 80.0 * 2.0 * 3.14159265;
