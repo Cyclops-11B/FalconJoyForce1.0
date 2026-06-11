@@ -38,6 +38,7 @@ static const double SOFT_RAMP = 0.004;  // m/s width of ramp zone
 static const double SHORT_VEL_NOISE = 0.0005;  // higher suppresses more low-speed noise
 static const double VEL_VLOW_POS_SCALE = 7.0;  // position error scale
 double posBlendMax = VEL_BLEND_LOW * 2.0;
+static const double VEL_RELEASE_MULT = 5.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
@@ -52,6 +53,15 @@ static const double CALIB_MAX = 0.120;       // reject implausibly large sweeps 
 
 static const double PUSH_DAMP_COEFF = 0.9; // damping strength on direction reversal (0=none, 1=strong)
 static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
+
+// ── Boundary detent: a ridge you push over right before the push zone ─────────
+static const double DETENT_WIDTH = 0.12; // fraction of work radius over which the ridge builds
+static const double DETENT_PEAK_N = 1.3;  // ridge height in N — resistance grows, then releases at threshold
+static const double DETENT_VEL_HYST = 0.003; // m/s direction threshold — detent arms moving out, suppresses moving back in
+
+// ── Exit pump: a brief inward kick right at the border when leaving the push zone ──
+static const double PUMP_PEAK_N = 1.3;  // kick strength (N) as you cross back out of push
+static const double PUMP_DECAY = 0.90;  // per-ms decay of the kick — lower = snappier/shorter pump
 
 //Feed forward variables ────────────────────────────────────────────────────────
 static const double FRICTION_CANCEL = .14;    // feed forward force in Newtons
@@ -329,7 +339,9 @@ struct AxisState {
             t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
             fc = 30.0 + (55.0 - 30.0) * t;  // was 15->30
         }
-        double alpha = 1.0 - exp(-2.0 * 3.14159265 * fc * dt);
+        double fcRel = fc;
+        if (fabs(rawVel) < fabs(smoothVel)) fcRel = fc * VEL_RELEASE_MULT; // decelerating → collapse faster
+        double alpha = 1.0 - exp(-2.0 * 3.14159265 * fcRel * dt);
         smoothVel += alpha * (rawVel - smoothVel);
 
         if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE * 2.0) {
@@ -415,7 +427,8 @@ static int16_t ToStick(double v) {
 static void ApplyForces(double y, double z,
     const AxisState& axY, const AxisState& axZ,
     double velY, double velZ,
-    double rumX, double rumY, double rumZ)
+    double rumX, double rumY, double rumZ,
+    double dt)
 {
     double offY = axY.Offset(y), offZ = axZ.Offset(z);
     double r = sqrt(offY * offY + offZ * offZ);
@@ -446,6 +459,47 @@ static void ApplyForces(double y, double z,
         forceY = -dirY * mag;
         forceZ = -dirZ * mag;
     }
+
+    // ── Boundary detent — felt approaching the push zone ─────────────────────────
+    // Direction-latched: full-strength on the way OUT (crisp pop at the threshold,
+    // unchanged from the plain position detent), but it releases the instant you turn
+    // back — so coming in it kicks out right at the border instead of lingering inward.
+    // This is a direction switch, not a speed-proportional gate, so outward feel and
+    // slow-approach crispness are untouched. Re-arms on every outward move, so repeated
+    // border crossings stay crisp.
+    double detentStart = PUSH_ENTER_RAD - DETENT_WIDTH;        // ridge begins here
+    if (r > detentStart && r < PUSH_ENTER_RAD && r > 0.0001) {
+        double dirY = offY / r, dirZ = offZ / r;
+        double vOut = velY * dirY + velZ * dirZ;               // + = moving outward, - = returning
+        static int detentArmed = 1;                            // holds last clear direction (hysteresis)
+        if (vOut > DETENT_VEL_HYST) detentArmed = 1;          // moving out → arm
+        else if (vOut < -DETENT_VEL_HYST) detentArmed = 0;     // moving back in → suppress (kicks out at border)
+        if (detentArmed) {
+            double u = (r - detentStart) / DETENT_WIDTH;       // 0 at ridge start, 1 at push threshold
+            u = u * u * (3.0 - 2.0 * u);                       // smoothstep — gentle build
+            double lip = u * DETENT_PEAK_N;
+            forceY += -dirY * lip;                             // resist outward; drops to 0 at threshold = the "pop"
+            forceZ += -dirZ * lip;
+        }
+    }
+
+    // ── Exit pump — a brief inward kick right at the border when leaving push ─────
+    // Reproduces the "pump" the plain position detent gave on the way back in, but
+    // fired as a self-decaying impulse at the moment you cross out of push, so it
+    // lands on the border instead of lingering inward across the band.
+    static bool inPushZone = false;
+    static double pumpEnv = 0.0;
+    bool nowInPush = (r >= PUSH_ENTER_RAD);
+    if (inPushZone && !nowInPush) pumpEnv = 1.0;               // just dropped below the border → fire
+    inPushZone = nowInPush;
+    if (pumpEnv > 0.01 && r > 0.0001) {
+        double dirY = offY / r, dirZ = offZ / r;
+        double kick = PUMP_PEAK_N * pumpEnv;
+        forceY += -dirY * kick;                                // inward kick toward center
+        forceZ += -dirZ * kick;
+    }
+    pumpEnv *= pow(PUMP_DECAY, dt * 1000.0);
+    if (pumpEnv < 0.01) pumpEnv = 0.0;
 
     forceY += rumY;
     forceZ += rumZ;
@@ -773,7 +827,7 @@ int main() {
         // ── Button 2: constant X preload to ease small corrections ───────────────────
         if (dhdGetButton(1) > 0) rumX += BTN2_X_SIGN * BTN2_X_FORCE;
 
-        ApplyForces(y, z, axY, axZ, axY.smoothVel, axZ.smoothVel, rumX, rumY, rumZ);
+        ApplyForces(y, z, axY, axZ, axY.smoothVel, axZ.smoothVel, rumX, rumY, rumZ, dt);
 
 
         // ── Button mask ────────────────────────────────────────────────────
