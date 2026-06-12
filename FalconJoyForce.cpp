@@ -82,8 +82,8 @@ static const double STICTION_BREAK_N = 0.09;   // constant breakaway force (N)
 static const double STICTION_VEL_ON = 0.0005; // motion floor (= your SHORT_VEL_NOISE)
 
 // ── Button 2 brace / preload ─────────────────────────────────────────────────
-static const double BTN2_X_FORCE = 0.9;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
-static const double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
+static const double BTN2_X_FORCE = 1.6;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
+static const double BTN2_X_SIGN = -1.0;  // +1 or -1 to flip push direction
 
 //  Spring box ─────────────────────────────────────────────────────────────────────
 static const double FORCE_SPRING_START = 0.5; // percentage of work radius where spring force starts
@@ -841,17 +841,41 @@ int main() {
         }
 
         if (rumX == 0.0) {
-            static double rumDirY = 1.0, rumDirZ = 0.0, rumDirX = 0.0;
+            static double rumDirY = 1.0, rumDirZ = 0.0;   // current (slewed) direction
+            static double tgtDirY = 1.0, tgtDirZ = 0.0;   // target direction
+            static double rumMagSm = 0.0;                 // smoothed magnitude
             static DWORD  lastDirChange = 0;
-            static const DWORD DIR_CHANGE = 40;
-            double mag = (rL * AMBIENT_LARGE_SCALE + rS * AMBIENT_SMALL_SCALE);
-            if (mag > 0.01) {
-                if (now - lastDirChange > DIR_CHANGE) {
-                    lastDirChange = now;
-                    double angle = ((rand() % 1000) / 1000.0) * 2.0 * 3.14159265;
-                    rumDirY = cos(angle); rumDirZ = sin(angle); rumDirX = 0.0;
-                }
-                rumX = rumDirX * mag; rumY = rumDirY * mag; rumZ = rumDirZ * mag;
+
+            static const DWORD  DIR_CHANGE = 140;     // ms between new target dirs (was 40)
+            static const double DIR_SLEW_HZ = 5.0;     // how fast dir eases toward target
+            static const double MAG_ATTACK_HZ = 7.0;     // ramp-up cutoff
+            static const double MAG_RELEASE_HZ = 3.0;     // ramp-down cutoff (slower = softer fade)
+
+            double magTarget = (rL * AMBIENT_LARGE_SCALE + rS * AMBIENT_SMALL_SCALE);
+
+            // pick a new target direction occasionally
+            if (now - lastDirChange > DIR_CHANGE) {
+                lastDirChange = now;
+                double angle = ((rand() % 1000) / 1000.0) * 2.0 * 3.14159265;
+                tgtDirY = cos(angle);
+                tgtDirZ = sin(angle);
+            }
+
+            // slew the actual direction toward the target, then renormalize
+            double aDir = 1.0 - exp(-2.0 * 3.14159265 * DIR_SLEW_HZ * dt);
+            rumDirY += aDir * (tgtDirY - rumDirY);
+            rumDirZ += aDir * (tgtDirZ - rumDirZ);
+            double dlen = sqrt(rumDirY * rumDirY + rumDirZ * rumDirZ);
+            if (dlen > 1e-6) { rumDirY /= dlen; rumDirZ /= dlen; }
+
+            // attack/release low-pass on magnitude
+            double mhz = (magTarget > rumMagSm) ? MAG_ATTACK_HZ : MAG_RELEASE_HZ;
+            double aMag = 1.0 - exp(-2.0 * 3.14159265 * mhz * dt);
+            rumMagSm += aMag * (magTarget - rumMagSm);
+
+            if (rumMagSm > 0.001) {
+                rumY = rumDirY * rumMagSm;
+                rumZ = rumDirZ * rumMagSm;
             }
         }
 
