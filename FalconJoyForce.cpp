@@ -39,6 +39,7 @@ static const double SHORT_VEL_NOISE = 0.0005;  // higher suppresses more low-spe
 static const double VEL_VLOW_POS_SCALE = 7.0;  // position error scale
 double posBlendMax = VEL_BLEND_LOW * 2.0;
 static const double VEL_RELEASE_MULT = 8.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
+static const double VEL_VERTICAL_SCALE = 1.5; // up/down (Z axis) velocity-zone output multiplier; left/right (Y axis) is unaffected. Independent of PUSH_VERTICAL_SCALE
 
 // Flick capture: bank fast motion the saturated stick can't express, pay it out as a short tail ──
 static const double FLICK_VEL_ON = 0.02;   // m/s above which motion is treated as a flick and banked (≈ where the stick saturates)
@@ -51,6 +52,7 @@ static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where pu
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
 static const double PUSH_SPEED_BASE = 0.44; // how fast cursor moves when entering push zone
 static const double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
+static const double PUSH_VERTICAL_SCALE = 0.5; // up/down (Z axis) push-speed multiplier; left/right (Y axis) is unaffected
 static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
 
 // Velocity zone stuff
@@ -100,6 +102,7 @@ static const double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
 static const double AMBIENT_SMALL_SCALE = 5.5;  // random rumble force scale
 static const double RUMBLE_DECAY = 0.60;
 static const double RUMBLE_FORCE_SCALE = 40.0; // overall scale factor of rumble force
+static const double AMBIENT_TAIL_QUIET = 0.05;        // ambient is held off through the whole recoil rumble tail; the tail is "over" (ambient allowed again) once incoming rumble decays below this — adapts to large shots' longer tails instead of a fixed time window
 
 // ──Recoil settings ──────────────────────────────────────────────────────
 static const double RUMBLE_LARGE_SCALE = 2.4;  // recoil force scale
@@ -120,6 +123,7 @@ static const DWORD MIN_EDGE_INTERVAL_MS = 35;   // longer than a single-shot env
 
 static const DWORD  RECOIL_DIR_CHANGE_MS = 40;  // how often direction randomizes (same as ambient)
 static const double RECOIL_X_SCALE = 20.0;      // backwards kick strength
+static const double RECOIL_RELEASE_HZ = 12.0;   // release shaping: low-pass cutoff for the recoil push on the way DOWN only. Higher = sharper release, lower = smoother/longer. (Up-edges pass instantly so the kick stays crisp.)
 static const double RECOIL_VERTICAL = 10.0;  // upward force as fraction of recoil (0=none, 1=equal to X)
 //static const double RECOIL_Z_RETURN_RATE = 0.2;  // how fast debt bleeds back (higher = snappier return)
 static const double EDGE_THRESHOLD = 2.0;  //how much of a rising edge is considered a new impulse
@@ -128,6 +132,12 @@ static const double RECOIL_TOPUP_BLEND = 0.6;   // how much of new peak boosts c
 static const double RECOIL_YZ_ONSET_N = 2;     // how many rapid shots before Y/Z texture starts
 static const double RECOIL_YZ_DECAY = 0.15;  // how fast Y/Z texture fades between shots
 static const double RECOIL_YZ_SCALE = 0.15;   // Y/Z texture strength
+static const double RECOIL_YZ_DIR_SLEW_HZ = 6.0;  // how fast lateral texture direction eases toward target while active (lower = smoother)
+static const double RECOIL_YZ_GATE_HI = 0.8;      // incoming-rumble level that TURNS ON the lateral texture (strong rumble / the kick only)
+static const double RECOIL_YZ_GATE_LO = 0.5;      // level that TURNS OFF (hysteresis) — texture cuts before the weak decay tail so it doesn't dribble into a jagged rumble
+static const double RECOIL_YZ_SMOOTH_HZ = 18.0;   // de-jags the active texture (follows packet steps smoothly instead of nudging per packet)
+static const double RECOIL_YZ_CUT_HZ = 45.0;      // fast hard-cut once the gate fails — clean release, no lingering
+static const DWORD  RUMBLE_FRESH_MS = 40;         // a rumble packet must have arrived within this window to count as live; gates BOTH the lateral texture and the recoil re-fire (stale held-peak guard) -> clean release
 
 
 // ── Recoil impulse queue ───────────────────────────────────────────────────
@@ -177,6 +187,10 @@ static double g_recoilYZForce = 0.0;  // current Y/Z texture magnitude
 static int    g_rapidShotCount = 0;    // consecutive shots that interrupted an impulse
 static double g_recoilYZDirY = 1.0;
 static double g_recoilYZDirZ = 0.0;
+static double g_recoilYZTgtY = 1.0;   // target lateral direction (actual dir slews toward it)
+static double g_recoilYZTgtZ = 0.0;
+static double g_recoilYZLevel = 0.0;  // smoothed, hysteresis-gated lateral texture magnitude
+static bool   g_recoilTailActive = false;  // true while a recoil's rumble tail is still arriving (ambient held off)
 static DWORD  g_lastYZDirChange = 0;
 static double          g_recoilDecay = 0.55;
 static volatile bool   g_running = true;
@@ -440,7 +454,7 @@ struct PushState2D {
             double base = fabs(entryVelZ) > 0.01 ? fabs(entryVelZ) : PUSH_SPEED_BASE;
             double mag = base + excess * (PUSH_SPEED_MAX - base);
             if (mag > PUSH_SPEED_MAX) mag = PUSH_SPEED_MAX;
-            outY = sign * mag;
+            outY = sign * mag * PUSH_VERTICAL_SCALE;   // up/down at reduced speed
         }
         return inPush;
     }
@@ -726,6 +740,7 @@ int main() {
 
             stickX += axY.flickCarry;   // pay out banked fast-motion as a short carry tail
             stickY += axZ.flickCarry;   // (ToStick clamps the sum to ±1)
+            stickY *= VEL_VERTICAL_SCALE;   // up/down at reduced speed (velocity zone)
         }
 
         rumblePhase += dt * 80.0 * 2.0 * 3.14159265;
@@ -747,6 +762,12 @@ int main() {
 
         if (recoilActive) {
             double liveMag = (g_rumbleLargePeak * RUMBLE_LARGE_SCALE + g_rumbleSmallPeak * RUMBLE_SMALL_SCALE);
+            // Stale held-peak guard: g_rumbleLargePeak/SmallPeak are raw and never
+            // self-decay, so after firing stops a latched peak keeps sustainingRumble true
+            // and re-fires the recoil (the ratchet on release). Zero it ONLY while the
+            // trigger is released — while the trigger is HELD we must never zero liveMag,
+            // or a momentary packet gap would drop the sustained-fire hold.
+            if (!btn1held && (now - g_lastRumbleTime) >= RUMBLE_FRESH_MS) liveMag = 0.0;
             double queuePeak = 0.0, nextPeak = 0.0;
             while (RecoilDequeue(nextPeak))
                 if (nextPeak > queuePeak) queuePeak = nextPeak;
@@ -793,8 +814,8 @@ int main() {
             if (g_recoilYZForce > 0.01 && (now - g_lastYZDirChange) > RECOIL_DIR_CHANGE_MS) {
                 g_lastYZDirChange = now;
                 double angle = ((rand() % 1000) / 1000.0) * 2.0 * 3.14159265;
-                g_recoilYZDirY = cos(angle);
-                g_recoilYZDirZ = sin(angle);
+                g_recoilYZTgtY = cos(angle);   // set target; actual dir slews toward it below
+                g_recoilYZTgtZ = sin(angle);
             }
 
             if (g_recoilFiring) {
@@ -805,8 +826,7 @@ int main() {
                     envelope = g_recoilAttack;
                 }
                 rumX = g_recoilPeak * envelope * RECOIL_X_SCALE * 2.0;
-                rumY = g_recoilYZDirY * g_recoilYZForce;
-                rumZ = g_recoilYZDirZ * g_recoilYZForce;
+                // lateral texture (rumY/rumZ) rendered by the consolidated slewed block below
 
                 if (!sustainingRumble && g_recoilAttack >= 1.0) {
                     double frameDecay = pow(g_recoilDecay, dt * 1000.0);
@@ -840,6 +860,35 @@ int main() {
             if (g_recoilForce < 0.01) { g_recoilForce = 0.0; g_recoilFiring = false; }
         }
 
+        // ── Recoil push release shaping ──────────────────────────────────────────────
+        // The raw recoil force sawtooths as it ramps down: each incoming tail packet
+        // re-bumps g_recoilForce, which then collapses fast before the next arrives — that
+        // sawtooth is the buzz. Snap UP instantly so the kick and sustained hold stay
+        // sharp, but low-pass on the way DOWN so the release tracks the rumble's decay
+        // envelope as one clean ramp. RECOIL_RELEASE_HZ sets sharper (higher) vs smoother.
+        static double g_recoilXOut = 0.0;
+        if (rumX >= g_recoilXOut) {
+            g_recoilXOut = rumX;                                   // rising → keep the sharp kick / hold
+        }
+        else {
+            double aRel = 1.0 - exp(-2.0 * 3.14159265 * RECOIL_RELEASE_HZ * dt);
+            g_recoilXOut += aRel * (rumX - g_recoilXOut);         // falling → smooth, buzz-free ramp down
+        }
+        if (fabs(g_recoilXOut) < 0.01) g_recoilXOut = 0.0;        // reach true 0 so ambient can resume
+        rumX = g_recoilXOut;
+
+        // Hold ambient off through the ENTIRE recoil rumble tail, however long it runs.
+        // A recoil opens a "tail session" that stays open until the incoming rumble has
+        // decayed below AMBIENT_TAIL_QUIET or stopped arriving. This adapts to shot size —
+        // larger shots have bigger/longer tails — which a fixed time window did not, which
+        // is why the buzz survived on larger shots.
+        {
+            double liveInNow = (g_rumbleLargePeak * RUMBLE_LARGE_SCALE + g_rumbleSmallPeak * RUMBLE_SMALL_SCALE);
+            bool   rumbleFresh = (now - g_lastRumbleTime) < RUMBLE_FRESH_MS;
+            if (recoilActive || g_recoilFiring)                      g_recoilTailActive = true;
+            else if (!rumbleFresh || liveInNow < AMBIENT_TAIL_QUIET) g_recoilTailActive = false;
+        }
+
         if (rumX == 0.0) {
             static double rumDirY = 1.0, rumDirZ = 0.0;   // current (slewed) direction
             static double tgtDirY = 1.0, tgtDirZ = 0.0;   // target direction
@@ -852,6 +901,11 @@ int main() {
             static const double MAG_RELEASE_HZ = 3.0;     // ramp-down cutoff (slower = softer fade)
 
             double magTarget = (rL * AMBIENT_LARGE_SCALE + rS * AMBIENT_SMALL_SCALE);
+
+            // Hold ambient off for the whole recoil tail session — the smoother below then
+            // keeps ambient faded out instead of buzzing on the tail. Genuine ambient with
+            // no recent firing is unaffected.
+            if (g_recoilTailActive) magTarget = 0.0;
 
             // pick a new target direction occasionally
             if (now - lastDirChange > DIR_CHANGE) {
@@ -876,6 +930,39 @@ int main() {
             if (rumMagSm > 0.001) {
                 rumY = rumDirY * rumMagSm;
                 rumZ = rumDirZ * rumMagSm;
+            }
+        }
+
+        // ── Recoil lateral texture: only during the STRONG part of the rumble ───────
+        // Incoming rumble per shot is a sharp spike then a long weak decaying tail of
+        // packets. Rendering the tail directly turned every little packet into a separate
+        // lateral nudge = the jagged rumble "coming down." A hysteresis gate keeps the
+        // texture on only while the rumble is genuinely strong (HI to turn on, LO to turn
+        // off), so it bursts with the kick and cuts before the weak tail. The level is
+        // smoothed while active (de-jag) and hard-cut once the gate fails (clean release).
+        {
+            double liveIn = (g_rumbleLargePeak * RUMBLE_LARGE_SCALE + g_rumbleSmallPeak * RUMBLE_SMALL_SCALE);
+            bool   rumbleIncoming = (now - g_lastRumbleTime) < RUMBLE_FRESH_MS;
+
+            static bool yzOn = false;
+            if (!recoilActive || !rumbleIncoming)   yzOn = false;            // outside fire / no fresh rumble → off
+            else if (liveIn > RECOIL_YZ_GATE_HI)    yzOn = true;             // strong rumble → on
+            else if (liveIn < RECOIL_YZ_GATE_LO)    yzOn = false;            // dropped into the weak tail → off
+
+            double yzTarget = yzOn ? liveIn * RECOIL_YZ_SCALE : 0.0;
+            double yzHz = (yzTarget > g_recoilYZLevel) ? RECOIL_YZ_SMOOTH_HZ : RECOIL_YZ_CUT_HZ;
+            double aMag = 1.0 - exp(-2.0 * 3.14159265 * yzHz * dt);
+            g_recoilYZLevel += aMag * (yzTarget - g_recoilYZLevel);
+            if (g_recoilYZLevel < 0.001) g_recoilYZLevel = 0.0;
+
+            if (g_recoilYZLevel > 0.0) {
+                double aDir = 1.0 - exp(-2.0 * 3.14159265 * RECOIL_YZ_DIR_SLEW_HZ * dt);
+                g_recoilYZDirY += aDir * (g_recoilYZTgtY - g_recoilYZDirY);
+                g_recoilYZDirZ += aDir * (g_recoilYZTgtZ - g_recoilYZDirZ);
+                double yzlen = sqrt(g_recoilYZDirY * g_recoilYZDirY + g_recoilYZDirZ * g_recoilYZDirZ);
+                if (yzlen > 1e-6) { g_recoilYZDirY /= yzlen; g_recoilYZDirZ /= yzlen; }
+                rumY += g_recoilYZDirY * g_recoilYZLevel;
+                rumZ += g_recoilYZDirZ * g_recoilYZLevel;
             }
         }
 
