@@ -19,7 +19,7 @@ static const BYTE PACKET_IN_MAGIC = 0xAA;
 static const BYTE PACKET_OUT_MAGIC = 0xBB;
 
 // ── Controller config ──────────────────────────────────────────────────────
-static const int UPDATE_RATE_MS = .25;  // 8 = ~125Hz, within Falcon's range
+static const int UPDATE_RATE_MS = 0;  // 0 is no frame wait; 1 is 1-2 frame wait; 8 = ~125Hz
 static const bool   INVERT_X = false;
 static const bool   INVERT_Y = false;
 
@@ -38,11 +38,11 @@ static const double SOFT_RAMP = 0.004;  // m/s width of ramp zone
 static const double SHORT_VEL_NOISE = 0.0005;  // higher suppresses more low-speed noise
 static const double VEL_VLOW_POS_SCALE = 7.0;  // position error scale
 double posBlendMax = VEL_BLEND_LOW * 2.0;
-static const double VEL_RELEASE_MULT = 8.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
-static const double VEL_VERTICAL_SCALE = 1.5; // up/down (Z axis) velocity-zone output multiplier; left/right (Y axis) is unaffected. Independent of PUSH_VERTICAL_SCALE
+static const double VEL_RELEASE_MULT = 35.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
+static const double VEL_VERTICAL_SCALE = 1.0; // up/down (Z axis) velocity-zone output multiplier; left/right (Y axis) is unaffected. Independent of PUSH_VERTICAL_SCALE
 
-// Flick capture: bank fast motion the saturated stick can't express, pay it out as a short tail ──
-static const double FLICK_VEL_ON = 0.02;   // m/s above which motion is treated as a flick and banked (≈ where the stick saturates)
+// Flick capture: bank fast motion when saturated
+static const double FLICK_VEL_ON = 0.01;   // m/s above which motion is treated as a flick and banked (≈ where the stick saturates)
 static const double FLICK_GAIN = 4.0;    // how much banked over-speed becomes extra deflection
 static const double FLICK_DECAY = 0.92;   // per-ms decay of the carry tail — lower = shorter tail
 static const double FLICK_CARRY_MAX = 0.9;    // clamp on carry deflection so big flicks don't over-throw
@@ -85,7 +85,7 @@ static const double STICTION_VEL_ON = 0.0005; // motion floor (= your SHORT_VEL_
 
 // ── Button 2 brace / preload ─────────────────────────────────────────────────
 static const double BTN2_X_FORCE = 1.6;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
-static const double BTN2_X_SIGN = -1.0;  // +1 or -1 to flip push direction
+static const double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
 
 //  Spring box ─────────────────────────────────────────────────────────────────────
 static const double FORCE_SPRING_START = 0.5; // percentage of work radius where spring force starts
@@ -95,13 +95,13 @@ static const double FORCE_DAMPING = 1.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
 //  Gravity Compensation ────────────────────────────────────────────────────────────
-static const double GRAVITY_COMP_SCALE = 2.05;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
+static const double GRAVITY_COMP_SCALE = 1.65;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
 static const double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
 static const double AMBIENT_SMALL_SCALE = 5.5;  // random rumble force scale
 static const double RUMBLE_DECAY = 0.60;
-static const double RUMBLE_FORCE_SCALE = 40.0; // overall scale factor of rumble force
+static const double RUMBLE_FORCE_SCALE = 2.0; // overall scale factor of rumble force
 static const double AMBIENT_TAIL_QUIET = 0.05;        // ambient is held off through the whole recoil rumble tail; the tail is "over" (ambient allowed again) once incoming rumble decays below this — adapts to large shots' longer tails instead of a fixed time window
 
 // ──Recoil settings ──────────────────────────────────────────────────────
@@ -134,10 +134,10 @@ static const double RECOIL_YZ_DECAY = 0.15;  // how fast Y/Z texture fades betwe
 static const double RECOIL_YZ_SCALE = 0.15;   // Y/Z texture strength
 static const double RECOIL_YZ_DIR_SLEW_HZ = 6.0;  // how fast lateral texture direction eases toward target while active (lower = smoother)
 static const double RECOIL_YZ_GATE_HI = 0.8;      // incoming-rumble level that TURNS ON the lateral texture (strong rumble / the kick only)
-static const double RECOIL_YZ_GATE_LO = 0.5;      // level that TURNS OFF (hysteresis) — texture cuts before the weak decay tail so it doesn't dribble into a jagged rumble
+static const double RECOIL_YZ_GATE_LO = 0.5;      // level that TURNS OFF (hysteresis) — texture cuts before the weak decay tail to prevent jagged release
 static const double RECOIL_YZ_SMOOTH_HZ = 18.0;   // de-jags the active texture (follows packet steps smoothly instead of nudging per packet)
-static const double RECOIL_YZ_CUT_HZ = 45.0;      // fast hard-cut once the gate fails — clean release, no lingering
-static const DWORD  RUMBLE_FRESH_MS = 40;         // a rumble packet must have arrived within this window to count as live; gates BOTH the lateral texture and the recoil re-fire (stale held-peak guard) -> clean release
+static const double RECOIL_YZ_CUT_HZ = 45.0;      // fast hard-cut once the gate fails
+static const DWORD  RUMBLE_FRESH_MS = 40;         // a rumble packet must have arrived within this window to count as live; then clean release
 
 
 // ── Recoil impulse queue ───────────────────────────────────────────────────
@@ -389,9 +389,14 @@ struct AxisState {
         double excess = sp - FLICK_VEL_ON;
         if (excess < 0.0) excess = 0.0;
         double target = (smoothVel >= 0.0 ? 1.0 : -1.0) * excess * FLICK_GAIN;
-        if (sp > FLICK_VEL_ON && target * flickCarry < 0.0) flickCarry = 0.0; // flicked the other way → cancel
-        if (fabs(target) > fabs(flickCarry)) flickCarry = target;            // fast attack: capture the peak
-        else flickCarry *= pow(FLICK_DECAY, dt * 1000.0);                    // slow release: pay out the tail
+
+        if (flickCarry != 0.0 && fabs(smoothVel) > VEL_DEADZONE) {
+            double velSign = (smoothVel >= 0.0) ? 1.0 : -1.0;
+            if (velSign * flickCarry < 0.0) flickCarry = 0.0;
+        }
+
+        if (fabs(target) > fabs(flickCarry)) flickCarry = target;
+        else flickCarry *= pow(FLICK_DECAY, dt * 1000.0);
         if (flickCarry > FLICK_CARRY_MAX) flickCarry = FLICK_CARRY_MAX;
         if (flickCarry < -FLICK_CARRY_MAX) flickCarry = -FLICK_CARRY_MAX;
         if (fabs(flickCarry) < 0.001) flickCarry = 0.0;
@@ -703,7 +708,7 @@ int main() {
 
                 double vlow = evalZone(v, VEL_VLOW_SENS, VEL_VLOW_CURVE);
                 double lo = evalZone(v, VEL_LOW_SENS, VEL_LOW_CURVE);
-                double hi = speed * VEL_HIGH_SENS;
+                double hi = pow(fmin(speed * VEL_HIGH_SENS, 1.0), VEL_HIGH_CURVE);
                 if (hi > 1.0) hi = 1.0;
 
                 // Blend vlow -> lo
@@ -725,9 +730,14 @@ int main() {
 
             // Position-error blend — kicks in when velocity signal is unreliable
             double velMag = sqrt(axY.smoothVel * axY.smoothVel + axZ.smoothVel * axZ.smoothVel);
-            double posBlend = 1.0 - velMag / posBlendMax;
-            posBlend = posBlend < 0.0 ? 0.0 : (posBlend > 1.0 ? 1.0 : posBlend);
-            posBlend = posBlend * posBlend * (3.0 - 2.0 * posBlend);
+            double posBlendRaw = 1.0 - velMag / posBlendMax;
+            posBlendRaw = posBlendRaw < 0.0 ? 0.0 : (posBlendRaw > 1.0 ? 1.0 : posBlendRaw);
+            posBlendRaw = posBlendRaw * posBlendRaw * (3.0 - 2.0 * posBlendRaw);
+
+            static double posBlendSm = 0.0;  // slew-limited — a one-frame velMag dip can't snap this
+            double aPB = 1.0 - exp(-2.0 * 3.14159265 * 6.0 * dt);
+            posBlendSm += aPB * (posBlendRaw - posBlendSm);
+            double posBlend = posBlendSm;
 
             if (posBlend > 0.0) {
                 double pcX = axY.PosError(y) * VEL_VLOW_POS_SCALE;
