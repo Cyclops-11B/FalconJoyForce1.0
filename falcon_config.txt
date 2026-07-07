@@ -1,19 +1,142 @@
-# Falcon button mapping
-# Each line: falcon_button=xbox_button
-# Falcon buttons: 0, 1, 2, 3
-#
-# Available Xbox outputs:
-#   A, B, X, Y
-#   START, BACK
-#   LB, RB        (bumpers)
-#   LT, RT        (triggers - analog, fully on or off)
-#   LS, RS        (stick clicks)
-#   DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT
-#   NONE          (disables the button)
-#
-# Note: falcon0 also controls recoil haptics when RT is assigned
+# FalconJoyForce configuration
+# Edit values and restart, or press F8 in the running program to reload live.
+# Anything after '#' or '//' is a comment. Missing keys keep their compiled defaults.
 
-falcon0=RT
-falcon1=LT
-falcon2=RB
-falcon3=RS
+# ---------- Serial / loop ----------
+SERIAL_PORT                = \\.\COM6   # COM port device path (\\.\COMn) -- restart required
+SERIAL_BAUD                = 115200     # baud rate -- restart required
+SERIAL_SEND_MS             = 2          # controller packet interval (ms); 2 = 500Hz; button changes always send immediately
+UPDATE_RATE_MS             = 0          # 0 = unpaced, USB throttles loop to ~1000Hz; >=1 = precise QPC pacing to that period (ms)
+INVERT_X                   = false      # flip stick X output
+INVERT_Y                   = false      # flip stick Y output
+
+# ---------- Velocity zones (aim response) ----------
+VEL_DEADZONE               = 0.0001     # m/s below which velocity produces no stick output
+VEL_VLOW_SENS              = 22         # sensitivity for very slow corrections
+VEL_VLOW_CURVE             = 0.8        # closer to 1.0 = more linear, less boosted
+VEL_LOW_SENS               = 18         # sensitivity at low speeds
+VEL_LOW_CURVE              = 0.88       # curve for slow zone (lower = more boost)
+VEL_HIGH_SENS              = 12         # sensitivity at high speeds
+VEL_HIGH_CURVE             = 0.95       # curve for fast zone (1.0 = linear)
+VEL_BLEND_VLOW             = 0.004      # m/s -- below this = pure vlow zone
+VEL_BLEND_LOW              = 0.025      # m/s -- below this = low speed zone
+VEL_BLEND_HIGH             = 0.15       # m/s -- above this = high speed zone
+SOFT_RAMP                  = 0.004      # m/s width of the ramp out of the deadzone
+SHORT_VEL_NOISE            = 0.0005     # higher suppresses more low-speed noise
+VEL_VLOW_POS_SCALE         = 7          # position-error assist scale at ultra-low speed
+VEL_RELEASE_MULT           = 35         # decel cutoff multiplier -- higher = snappier stop, lower = floatier
+VEL_VERTICAL_SCALE         = 1          # Z-axis (up/down) velocity-zone output multiplier; Y unaffected
+
+# ---------- Velocity estimator internals ----------
+VEL_FC_VLOW                = 9          # smoothing cutoff Hz in vlow bracket -- higher = less latency, more jitter
+VEL_FC_LOW                 = 18         # cutoff Hz at VEL_BLEND_LOW (smoothstepped from VEL_FC_VLOW)
+VEL_FC_HIGH                = 30         # cutoff Hz at VEL_BLEND_HIGH
+VEL_FC_MAX                 = 55         # cutoff Hz at VEL_FC_SPEED_CEIL (fast motion = nearly raw)
+SLOWREF_HZ                 = 1.2        # drift rate of the slowRef low-pass (PosError anchor)
+VEL_WINDOW_SAMPLES         = 6          # velocity averaging window, 2..8 samples (= that many ms at 1kHz)
+VEL_ZERO_FRAMES            = 10         # consecutive sub-deadzone frames before smoothVel hard-zeros
+POSBLEND_MAX_MULT          = 2          # posBlendMax = VEL_BLEND_LOW * this -- speed below which position assist blends in
+POSBLEND_SLEW_HZ           = 6          # slew on the position-blend amount -- one-frame dips can't snap it
+
+# ---------- Flick capture ----------
+FLICK_VEL_ON               = 0.01       # m/s above which motion is banked as a flick (~ where the stick saturates)
+FLICK_GAIN                 = 4          # how much banked over-speed becomes extra deflection
+FLICK_DECAY                = 0.92       # PER-MS decay of the carry tail -- lower = shorter tail
+FLICK_CARRY_MAX            = 0.9        # clamp on carry deflection so big flicks don't over-throw
+
+# ---------- Push zone ----------
+PUSH_ENTER_RAD             = 0.56       # fraction of work radius where push zone kicks in
+PUSH_EXIT_RAD              = 0.56       # fraction of work radius where push zone stops acting
+PUSH_SPEED_BASE            = 0.44       # cursor speed on entering push zone
+PUSH_SPEED_MAX             = 6          # maximum push speed at full tilt
+PUSH_VERTICAL_SCALE        = 0.5        # Z-axis push-speed multiplier; Y unaffected
+HALF_RANGE_MAX             = 0.06       # work radius (m) -- takes effect on next F11 recalibrate
+VEL_FC_SPEED_CEIL          = 0.06       # velocity ceiling (m/s) for the top smoothing bracket -- NOT the work area
+CALIB_FILL                 = 0.95       # fraction of measured reach mapping to full deflection
+CALIB_MIN                  = 0.025      # reject implausibly small calibration sweeps (m)
+CALIB_MAX                  = 0.12       # reject implausibly large calibration sweeps (m)
+PUSH_DAMP_COEFF            = 0.9        # stick damping strength on push-zone direction reversal (0=none, 1=strong)
+PUSH_DAMP_DECAY            = 3          # how quickly reversal damping fades (higher = faster)
+
+# ---------- Boundary detent & exit pump ----------
+DETENT_WIDTH               = 0.12       # fraction of work radius over which the ridge builds
+DETENT_PEAK_N              = 1.6        # ridge height (N) -- resistance grows, then releases at the push threshold
+DETENT_VEL_HYST            = 0.003      # m/s radial-direction threshold -- arms moving out, suppresses moving back in
+DETENT_VOUT_HZ             = 10         # low-pass on the ARMING signal only (not the force); lower = steadier latch, lazier reversal release
+PUMP_PEAK_N                = 1.3        # inward kick strength (N) crossing back out of push
+PUMP_DECAY                 = 0.9        # PER-MS decay of the kick -- lower = snappier/shorter pump
+
+# ---------- Friction / stiction compensation ----------
+FRICTION_CANCEL            = 0.14       # Coulomb feed-forward force (N) along motion
+FRICTION_VEL_MIN           = 0.003      # m/s where assist engages
+FRICTION_VEL_FULL          = 0.004      # m/s where assist reaches full (fixed window, not tied to MIN)
+FRICTION_VEL_MAX           = 0.08       # m/s by which assist has faded back out
+STICTION_BREAK_N           = 0.09       # constant breakaway force (N)
+STICTION_VEL_ON            = 0.0005     # motion floor for breakaway (= SHORT_VEL_NOISE)
+VISCOUS_CANCEL             = 0          # N per m/s -- cancels speed-proportional drag. 0=off; start ~1.0; too high = self-driving
+VISCOUS_MAX_N              = 0.6        # hard cap on viscous assist (safety against runaway)
+DITHER_N                   = 0          # stiction dither amplitude (N). 0=off; try 0.05-0.12; lower if crosshair jitters
+DITHER_HZ                  = 70         # dither frequency -- high enough not to read as motion
+DITHER_VEL_FADE            = 0.01       # m/s above which dither is fully faded out
+
+# ---------- Button 2 brace / preload ----------
+BTN2_X_FORCE               = 1.6        # constant X force while button 2 held (N) -- preloads mechanism for fine corrections
+BTN2_X_SIGN                = 1          # +1 or -1 to flip preload direction
+
+# ---------- Spring wall ----------
+FORCE_SPRING_START         = 0.5        # fraction of work radius where spring force starts
+FORCE_MAX_RAD              = 0.88       # fraction of work radius where max force is reached
+FORCE_MAX_N                = 8          # maximum wall force (N)
+FORCE_DAMPING              = 1          # bidirectional radial damping -- removes wall-contact buzz energy; higher = deader wall
+FORCE_EXPONENT             = 2.3        # force ramp shape -- lower = builds earlier and harder
+DAMP_VEL_MIN               = 0.01       # m/s below which no ENHANCED damping (base FORCE_DAMPING always active)
+DAMP_VEL_MAX               = 0.02       # m/s above which full enhanced damping (smoothstepped)
+FORCE_YZ_CAP_N             = 7.8        # hard cap on combined Y/Z force (spring + lateral rumble)
+
+# ---------- Gravity compensation ----------
+GRAVITY_COMP_SCALE         = 1.65       # 1.0 = physical; >1 preloads joints upward and adds asymmetric drag
+
+# ---------- Ambient rumble ----------
+AMBIENT_LARGE_SCALE        = 5.5        # large-motor ambient force scale
+AMBIENT_SMALL_SCALE        = 5.5        # small-motor ambient force scale
+RUMBLE_DECAY               = 0.7        # PER-MS retention of incoming rumble (0.70/ms ~= old 0.60/frame at 700Hz)
+RUMBLE_FORCE_SCALE         = 2          # overall scale factor of rumble force
+AMBIENT_TAIL_QUIET         = 0.05       # ambient held off until incoming rumble decays below this (adapts to shot size)
+AMBIENT_DIR_CHANGE_MS      = 140        # ms between new ambient target directions
+AMBIENT_DIR_SLEW_HZ        = 5          # how fast ambient direction eases toward its target
+AMBIENT_ATTACK_HZ          = 7          # ambient magnitude ramp-up cutoff
+AMBIENT_RELEASE_HZ         = 3          # ambient magnitude ramp-down cutoff (slower = softer fade)
+
+# ---------- Recoil ----------
+RUMBLE_LARGE_SCALE         = 2.4        # recoil scale for large-motor rumble
+RUMBLE_SMALL_SCALE         = 2.4        # recoil scale for small-motor rumble
+RECOIL_WINDOW_MS           = 250        # ms after btn1 release to still catch trigger recoil -- shorter = snappier, <100 may miss single shots
+RECOIL_SUSTAIN_THRESHOLD   = 0.5        # liveMag above this = still firing; PRIMARY per-title linger knob -- raise so weak tail packets can't sustain
+RECOIL_CURVE               = 0.5        # recoil compressor -- 0.3 boosts small recoils; 1.0 = linear
+RECOIL_DECAY               = 0.45       # initial per-ms decay (overwritten per shot by MIN..MAX mapping)
+RECOIL_DECAY_MIN           = 0.25       # per-ms decay for weak shots (fast cutoff)
+RECOIL_DECAY_MAX           = 0.75       # per-ms decay for strong shots (long sustain)
+RECOIL_MAG_SCALE           = 20         # liveMag that maps to DECAY_MAX -- raise so fewer shots get the long sustain
+RECOIL_AIM_DAMP            = 0.4        # stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
+RECOIL_DAMP_DECAY          = 8          # how fast aim damp fades per second -- raise if aim feels muddy after bursts
+RECOIL_PUSH_SCALE          = 20         # sustained push force multiplier
+BLEED_Y_SCALE              = 0.5        # velocity bleed: fraction of Y velocity gated at full recoil (settle suppression)
+BLEED_Z_DOWN               = 0.8        # stronger bleed on downward Z -- gravity is the main tail-drift cause
+BLEED_Z_UP                 = 0.4        # lighter bleed on upward Z
+RECOIL_ATTACK_SEC          = 0          # attack envelope length (0 = instant kick)
+MIN_EDGE_INTERVAL_MS       = 35         # minimum ms between edges counted as new impulses
+RECOIL_DIR_CHANGE_MS       = 40         # ms between lateral texture direction randomizations
+RECOIL_X_SCALE             = 20         # backwards kick strength
+RECOIL_RELEASE_HZ          = 12         # down-ramp low-pass; higher = sharper release (past ~30 the sawtooth buzz returns); up-edges pass instantly
+RECOIL_VERTICAL            = 10         # upward force as fraction of recoil (0=none)
+EDGE_THRESHOLD             = 2          # rising-edge size considered a new impulse
+RECOIL_TOPUP_BLEND         = 0.6        # how much of a new peak boosts current force
+RECOIL_YZ_ONSET_N          = 2          # rapid shots before Y/Z texture starts
+RECOIL_YZ_DECAY            = 0.15       # how fast Y/Z texture fades between shots
+RECOIL_YZ_SCALE            = 0.15       # Y/Z texture strength
+RECOIL_YZ_DIR_SLEW_HZ      = 6          # lateral texture direction slew while active (lower = smoother)
+RECOIL_YZ_GATE_HI          = 0.8        # incoming level that turns lateral texture ON (the strong kick only)
+RECOIL_YZ_GATE_LO          = 0.5        # level that turns it OFF (hysteresis) -- cuts before the weak tail to prevent jagged release
+RECOIL_YZ_SMOOTH_HZ        = 18         # de-jags the active texture (follows packet steps smoothly)
+RECOIL_YZ_CUT_HZ           = 45         # fast hard-cut once the gate fails
+RUMBLE_FRESH_MS            = 40         # rumble packet must arrive within this window to count as live; then clean release

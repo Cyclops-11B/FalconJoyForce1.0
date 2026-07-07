@@ -1,143 +1,496 @@
 ﻿// Falcon - Mouse emulation joystick with Force
 // Novint Falcon -> Pico 2 W (CP2102 serial) -> Xbox 360 controller
+//
+// CHANGES THIS REVISION:
+//  - dt now measured with QueryPerformanceCounter (GetTickCount is 1ms-quantized;
+//    at ~1kHz every IIR filter was being fed a wrong dt every frame)
+//  - UPDATE_RATE_MS = 0 -> NO Sleep at all; the dhd USB transactions pace the loop
+//    to 1000 Hz naturally (per Force Dimension support). UPDATE_RATE_MS >= 1 ->
+//    precise QPC-deadline pacing (coarse Sleep then yield-spin) instead of raw Sleep().
+//  - Controller serial packets decimated to SERIAL_SEND_MS (default 2ms = 500Hz);
+//    button changes still send immediately. Haptic loop no longer stalls on WriteFile.
+//  - RUMBLE_DECAY converted from per-FRAME to per-MILLISECOND (dt-based) so feel is
+//    identical at any loop rate. Default changed 0.60 -> 0.70 to match old feel at ~700Hz.
+//  - FIXED: ApplyForces had local static FRICTION_VEL_MIN/MAX shadowing the globals;
+//    the global FRICTION_VEL_MIN=0.0006 was never in effect (0.003 was). Shadows
+//    removed; global default set to 0.003 so behavior is unchanged but now tunable.
+//  - Keyboard polling throttled to every 25ms; serial-thread RAW print gated on debug.
+//  - Config file: loads falcon_config.txt at startup (auto-writes a template with all
+//    defaults if missing). '#' and '//' comments. F8 = live reload while running.
 
+#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
 #include <math.h>
 #include <dhdc.h>
-#include <string.h>
 
 #pragma comment(lib, "winmm.lib")
 
 
 // ── Serial port ────────────────────────────────────────────────────────────
-static const char* SERIAL_PORT = "\\\\.\\COM6";
-static const DWORD SERIAL_BAUD = 115200;
+static char  SERIAL_PORT[64] = "\\\\.\\COM6";
+static DWORD SERIAL_BAUD = 115200;
+static double SERIAL_SEND_MS = 2.0;   // controller packet interval (ms). 2ms = 500Hz, plenty for the Pico/Xbox side; button changes always send immediately
 
 // ── Packet constants ───────────────────────────────────────────────────────
 static const BYTE PACKET_IN_MAGIC = 0xAA;
 static const BYTE PACKET_OUT_MAGIC = 0xBB;
 
 // ── Controller config ──────────────────────────────────────────────────────
-static const int UPDATE_RATE_MS = 0;  // 0 is no frame wait; 1 is 1-2 frame wait; 8 = ~125Hz
-static const bool   INVERT_X = false;
-static const bool   INVERT_Y = false;
+static int  UPDATE_RATE_MS = 0;  // 0 = unpaced, dhd USB calls throttle the loop (~1000Hz); >=1 = precise QPC pacing to that period. MUST stay int.
+static bool INVERT_X = false;
+static bool INVERT_Y = false;
 
 // ──Velocity settings ──────────────────────────────────────────────────────
-static const double VEL_DEADZONE = 0.0001;
-static const double VEL_VLOW_SENS = 22.0;    // sensitivity for very slow corrections
-static const double VEL_VLOW_CURVE = 0.80;   // closer to 1.0 = more linear, less boosted
-static const double VEL_LOW_SENS = 18.0;  // sensitivity at low speeds
-static const double VEL_LOW_CURVE = 0.88; // curve for slow zone (lower = more boost)
-static const double VEL_HIGH_SENS = 12.0; // sensitivity at high speeds
-static const double VEL_HIGH_CURVE = 0.95; // curve for fast zone (1.0 = linear)
-static const double VEL_BLEND_VLOW = 0.004;  // below this = pure vlow zone
-static const double VEL_BLEND_LOW = 0.025; // below this = low speed
-static const double VEL_BLEND_HIGH = 0.15; // above this = high speed
-static const double SOFT_RAMP = 0.004;  // m/s width of ramp zone
-static const double SHORT_VEL_NOISE = 0.0005;  // higher suppresses more low-speed noise
-static const double VEL_VLOW_POS_SCALE = 7.0;  // position error scale
-double posBlendMax = VEL_BLEND_LOW * 2.0;
-static const double VEL_RELEASE_MULT = 35.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
-static const double VEL_VERTICAL_SCALE = 1.0; // up/down (Z axis) velocity-zone output multiplier; left/right (Y axis) is unaffected. Independent of PUSH_VERTICAL_SCALE
+static double VEL_DEADZONE = 0.0001;
+static double VEL_VLOW_SENS = 22.0;    // sensitivity for very slow corrections
+static double VEL_VLOW_CURVE = 0.80;   // closer to 1.0 = more linear, less boosted
+static double VEL_LOW_SENS = 18.0;  // sensitivity at low speeds
+static double VEL_LOW_CURVE = 0.88; // curve for slow zone (lower = more boost)
+static double VEL_HIGH_SENS = 12.0; // sensitivity at high speeds
+static double VEL_HIGH_CURVE = 0.95; // curve for fast zone (1.0 = linear)
+static double VEL_BLEND_VLOW = 0.004;  // below this = pure vlow zone
+static double VEL_BLEND_LOW = 0.025; // below this = low speed
+static double VEL_BLEND_HIGH = 0.15; // above this = high speed
+static double SOFT_RAMP = 0.004;  // m/s width of ramp zone
+static double SHORT_VEL_NOISE = 0.0005;  // higher suppresses more low-speed noise
+static double VEL_VLOW_POS_SCALE = 7.0;  // position error scale
+
+// Velocity estimator internals (previously hardcoded inside AxisState)
+static double VEL_FC_VLOW = 9.0;    // smoothing cutoff (Hz) in the vlow bracket — higher = less latency, more jitter
+static double VEL_FC_LOW = 18.0;    // cutoff at VEL_BLEND_LOW (smoothstepped from VEL_FC_VLOW)
+static double VEL_FC_HIGH = 30.0;   // cutoff at VEL_BLEND_HIGH
+static double VEL_FC_MAX = 55.0;    // cutoff at VEL_FC_SPEED_CEIL (fast motion = nearly raw)
+static double SLOWREF_HZ = 1.2;     // drift rate of the slowRef low-pass reference (PosError anchor)
+static int    VEL_WINDOW_SAMPLES = 6;  // velocity averaging window length (2..8; history arrays are sized 8). Time span is samples/loop-rate, so 6 = ~6ms at 1kHz
+static int    VEL_ZERO_FRAMES = 10;    // consecutive sub-deadzone frames before smoothVel hard-zeros (frame-count, so loop-rate dependent by design — it's a settle guard)
+static double POSBLEND_MAX_MULT = 2.0; // posBlendMax = VEL_BLEND_LOW * this — velocity magnitude below which position-error assist blends in
+static double POSBLEND_SLEW_HZ = 6.0;  // slew on the position-blend amount — a one-frame velMag dip can't snap it
+
+double posBlendMax = VEL_BLEND_LOW * POSBLEND_MAX_MULT;   // derived — recomputed after config load
+static double VEL_RELEASE_MULT = 35.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
+static double VEL_VERTICAL_SCALE = 1.0; // up/down (Z axis) velocity-zone output multiplier; left/right (Y axis) is unaffected. Independent of PUSH_VERTICAL_SCALE
 
 // Flick capture: bank fast motion when saturated
-static const double FLICK_VEL_ON = 0.01;   // m/s above which motion is treated as a flick and banked (≈ where the stick saturates)
-static const double FLICK_GAIN = 4.0;    // how much banked over-speed becomes extra deflection
-static const double FLICK_DECAY = 0.92;   // per-ms decay of the carry tail — lower = shorter tail
-static const double FLICK_CARRY_MAX = 0.9;    // clamp on carry deflection so big flicks don't over-throw
+static double FLICK_VEL_ON = 0.01;   // m/s above which motion is treated as a flick and banked (≈ where the stick saturates)
+static double FLICK_GAIN = 4.0;    // how much banked over-speed becomes extra deflection
+static double FLICK_DECAY = 0.92;   // per-ms decay of the carry tail — lower = shorter tail
+static double FLICK_CARRY_MAX = 0.9;    // clamp on carry deflection so big flicks don't over-throw
 
 // Push zone variables
-static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
-static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
-static const double PUSH_SPEED_BASE = 0.44; // how fast cursor moves when entering push zone
-static const double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
-static const double PUSH_VERTICAL_SCALE = 0.5; // up/down (Z axis) push-speed multiplier; left/right (Y axis) is unaffected
-static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
+static double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
+static double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
+static double PUSH_SPEED_BASE = 0.44; // how fast cursor moves when entering push zone
+static double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
+static double PUSH_VERTICAL_SCALE = 0.5; // up/down (Z axis) push-speed multiplier; left/right (Y axis) is unaffected
+static double HALF_RANGE_MAX = 0.06; // how large work radius is (in m) — config changes take effect on next F11 recalibrate
 
 // Velocity zone stuff
-static const double VEL_FC_SPEED_CEIL = 0.06; // velocity ceiling for top smoothing bracket (m/s) — NOT the work area
-static const double CALIB_FILL = 0.95;        // fraction of measured reach that maps to full deflection
-static const double CALIB_MIN = 0.025;       // reject implausibly small sweeps (m)
-static const double CALIB_MAX = 0.120;       // reject implausibly large sweeps (m)
+static double VEL_FC_SPEED_CEIL = 0.06; // velocity ceiling for top smoothing bracket (m/s) — NOT the work area
+static double CALIB_FILL = 0.95;        // fraction of measured reach that maps to full deflection
+static double CALIB_MIN = 0.025;       // reject implausibly small sweeps (m)
+static double CALIB_MAX = 0.120;       // reject implausibly large sweeps (m)
 
 // Push zone re-entry damping
-static const double PUSH_DAMP_COEFF = 0.9; // damping strength on direction reversal (0=none, 1=strong)
-static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
+static double PUSH_DAMP_COEFF = 0.9; // damping strength on direction reversal (0=none, 1=strong)
+static double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
 
 // ── Boundary detent: a ridge you push over right before the push zone ─────────
-static const double DETENT_WIDTH = 0.12; // fraction of work radius over which the ridge builds
-static const double DETENT_PEAK_N = 1.6;  // ridge height in N — resistance grows, then releases at threshold
-static const double DETENT_VEL_HYST = 0.003; // m/s direction threshold — detent arms moving out, suppresses moving back in
+static double DETENT_WIDTH = 0.12; // fraction of work radius over which the ridge builds
+static double DETENT_PEAK_N = 1.6;  // ridge height in N — resistance grows, then releases at threshold
+static double DETENT_VEL_HYST = 0.003; // m/s direction threshold — detent arms moving out, suppresses moving back in
+static double DETENT_VOUT_HZ = 10.0;   // low-pass on the radial-velocity ARMING signal only (not the force). Tangential slides along the wall make raw vOut tremor across ±HYST and buzz the latch; genuine reversals pass a 10Hz filter in ~15-20ms. Lower = steadier latch, slower reversal release
+static double EDGE_HYST = 0.02;        // fraction of work radius of SPATIAL hysteresis on the pop latch at the push border. Once popped through, the ridge stays released (and the pump won't fire) until r retreats this far back inside — stops mm-wobble on the border from strobing the wall on/off
 
 // ── Exit pump: a brief inward kick right at the border when leaving the push zone ──
-static const double PUMP_PEAK_N = 1.3;  // kick strength (N) as you cross back out of push
-static const double PUMP_DECAY = 0.90;  // per-ms decay of the kick — lower = snappier/shorter pump
+static double PUMP_PEAK_N = 1.3;  // kick strength (N) as you cross back out of push
+static double PUMP_DECAY = 0.90;  // per-ms decay of the kick — lower = snappier/shorter pump
 
 //  Feed forward variables ────────────────────────────────────────────────────────
-static const double FRICTION_CANCEL = .14;    // feed forward force in Newtons
-static const double FRICTION_VEL_MIN = 0.0006; // engage almost as soon as motion starts
-static const double FRICTION_VEL_FULL = 0.004;  // assist reaches full here (fixed window, not tied to MIN)
-static const double FRICTION_VEL_MAX = 0.08;   // faded back out by here
+static double FRICTION_CANCEL = .14;    // feed forward force in Newtons
+static double FRICTION_VEL_MIN = 0.003;  // engage threshold — WAS shadowed to 0.003 inside ApplyForces; default now matches the value you've actually been feeling
+static double FRICTION_VEL_FULL = 0.004;  // assist reaches full here (fixed window, not tied to MIN)
+static double FRICTION_VEL_MAX = 0.08;   // faded back out by here
 
-static const double STICTION_BREAK_N = 0.09;   // constant breakaway force (N)
-static const double STICTION_VEL_ON = 0.0005; // motion floor (= your SHORT_VEL_NOISE)
+static double STICTION_BREAK_N = 0.09;   // constant breakaway force (N)
+static double STICTION_VEL_ON = 0.0005; // motion floor (= your SHORT_VEL_NOISE)
+
+// Viscous drag cancellation — the Falcon's drag grows with speed (back-EMF, bearing
+// viscosity); Coulomb cancel is constant-magnitude and can't touch that component.
+static double VISCOUS_CANCEL = 0.0;   // N per (m/s) along velocity. 0 = off. Start ~1.0, raise until fast sweeps feel free; too high = self-driving/instability against the wall
+static double VISCOUS_MAX_N = 0.6;    // hard cap on the viscous assist contribution (safety against runaway at high speed)
+
+// Stiction dither — tiny high-frequency circular force that keeps the mechanism in
+// kinetic (never static) friction, killing the re-grip catch at reversals and the
+// start of micro-corrections. Fades out with speed: only needed near-stopped.
+static double DITHER_N = 0.0;         // amplitude (N). 0 = off. Try 0.05-0.12; if the crosshair picks up jitter, lower this (or nudge SHORT_VEL_NOISE up)
+static double DITHER_HZ = 70.0;       // dither frequency — high enough to not read as motion, low enough for the motors to render
+static double DITHER_VEL_FADE = 0.010; // m/s above which dither is fully faded out
 
 // ── Button 2 brace / preload ─────────────────────────────────────────────────
-static const double BTN2_X_FORCE = 1.6;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
-static const double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
+static double BTN2_X_FORCE = 1.6;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
+static double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
 
 //  Spring box ─────────────────────────────────────────────────────────────────────
-static const double FORCE_SPRING_START = 0.5; // percentage of work radius where spring force starts
-static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
-static const double FORCE_MAX_N = 8; // maximum allowable Force (in N)
-static const double FORCE_DAMPING = 1.0; // cut down on springiness
-static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
+static double FORCE_SPRING_START = 0.5; // percentage of work radius where spring force starts
+static double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
+static double FORCE_MAX_N = 8; // maximum allowable Force (in N)
+static double FORCE_DAMPING = 1.0; // cut down on springiness
+static double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
+static double DAMP_VEL_MIN = 0.010; // below this speed = no ENHANCED wall damping (base FORCE_DAMPING always active)
+static double DAMP_VEL_MAX = 0.020; // above this speed = full enhanced damping (smoothstepped between)
+static double FORCE_YZ_CAP_N = 7.8; // hard cap on combined Y/Z force magnitude (spring + lateral rumble)
 
 //  Gravity Compensation ────────────────────────────────────────────────────────────
-static const double GRAVITY_COMP_SCALE = 1.65;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
+static double GRAVITY_COMP_SCALE = 1.65;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
-static const double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
-static const double AMBIENT_SMALL_SCALE = 5.5;  // random rumble force scale
-static const double RUMBLE_DECAY = 0.60;
-static const double RUMBLE_FORCE_SCALE = 2.0; // overall scale factor of rumble force
-static const double AMBIENT_TAIL_QUIET = 0.05;        // ambient is held off through the whole recoil rumble tail; the tail is "over" (ambient allowed again) once incoming rumble decays below this — adapts to large shots' longer tails instead of a fixed time window
+static double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
+static double AMBIENT_SMALL_SCALE = 5.5;  // random rumble force scale
+static double RUMBLE_DECAY = 0.70;  // NOW PER-MILLISECOND (dt-based, loop-rate independent). 0.70/ms ≈ old 0.60/frame at ~700Hz
+static double RUMBLE_FORCE_SCALE = 2.0; // overall scale factor of rumble force
+static double AMBIENT_TAIL_QUIET = 0.05;        // ambient is held off through the whole recoil rumble tail; the tail is "over" (ambient allowed again) once incoming rumble decays below this — adapts to large shots' longer tails instead of a fixed time window
+static DWORD  AMBIENT_DIR_CHANGE_MS = 140;      // ms between new ambient target directions
+static double AMBIENT_DIR_SLEW_HZ = 5.0;        // how fast ambient direction eases toward its target
+static double AMBIENT_ATTACK_HZ = 7.0;          // ambient magnitude ramp-up cutoff
+static double AMBIENT_RELEASE_HZ = 3.0;         // ambient magnitude ramp-down cutoff (slower = softer fade)
 
 // ──Recoil settings ──────────────────────────────────────────────────────
-static const double RUMBLE_LARGE_SCALE = 2.4;  // recoil force scale
-static const double RUMBLE_SMALL_SCALE = 2.4;  // recoil force scale
-static const DWORD  RECOIL_WINDOW_MS = 250; // ms after btn 1 release to still catch trigger recoil
-static const double RECOIL_SUSTAIN_THRESHOLD = 0.5;  // liveMag above this = sustaining
-static const double RECOIL_CURVE = 0.50; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
-static const double RECOIL_DECAY = 0.45;
-static const double RECOIL_DECAY_MIN = 0.25;  // decay for weak shots (fast cutoff)
-static const double RECOIL_DECAY_MAX = 0.75;  // decay for strong shots (long sustain)
-static const double RECOIL_MAG_SCALE = 20.0;  // liveMag value that maps to DECAY_MAX
-static const double RECOIL_AIM_DAMP = 0.4;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
-static const double RECOIL_DAMP_DECAY = 8.0;  // how fast aim damp fades per second
-static const double RECOIL_PUSH_SCALE = 20.0;  // sustained push force multiplier
+static double RUMBLE_LARGE_SCALE = 2.4;  // recoil force scale
+static double RUMBLE_SMALL_SCALE = 2.4;  // recoil force scale
+static DWORD  RECOIL_WINDOW_MS = 250; // ms after btn 1 release to still catch trigger recoil
+static double RECOIL_SUSTAIN_THRESHOLD = 0.5;  // liveMag above this = sustaining
+static double RECOIL_CURVE = 0.50; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
+static double RECOIL_DECAY = 0.45;
+static double RECOIL_DECAY_MIN = 0.25;  // decay for weak shots (fast cutoff)
+static double RECOIL_DECAY_MAX = 0.75;  // decay for strong shots (long sustain)
+static double RECOIL_MAG_SCALE = 20.0;  // liveMag value that maps to DECAY_MAX
+static double RECOIL_AIM_DAMP = 0.4;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
+static double RECOIL_DAMP_DECAY = 8.0;  // how fast aim damp fades per second
+static double RECOIL_PUSH_SCALE = 20.0;  // sustained push force multiplier
+static double BLEED_Y_SCALE = 0.5;   // recoil velocity bleed: fraction of Y velocity gated at full recoil (settle suppression)
+static double BLEED_Z_DOWN = 0.8;    // stronger bleed on downward Z motion — gravity is the main tail-drift cause
+static double BLEED_Z_UP = 0.4;      // lighter bleed on upward Z motion
 
-static const double RECOIL_ATTACK_SEC = 0.0;
-static const DWORD MIN_EDGE_INTERVAL_MS = 35;   // longer than a single-shot envelope
+static double RECOIL_ATTACK_SEC = 0.0;
+static DWORD MIN_EDGE_INTERVAL_MS = 35;   // longer than a single-shot envelope
 
-static const DWORD  RECOIL_DIR_CHANGE_MS = 40;  // how often direction randomizes (same as ambient)
-static const double RECOIL_X_SCALE = 20.0;      // backwards kick strength
-static const double RECOIL_RELEASE_HZ = 12.0;   // release shaping: low-pass cutoff for the recoil push on the way DOWN only. Higher = sharper release, lower = smoother/longer. (Up-edges pass instantly so the kick stays crisp.)
-static const double RECOIL_VERTICAL = 10.0;  // upward force as fraction of recoil (0=none, 1=equal to X)
-//static const double RECOIL_Z_RETURN_RATE = 0.2;  // how fast debt bleeds back (higher = snappier return)
-static const double EDGE_THRESHOLD = 2.0;  //how much of a rising edge is considered a new impulse
+static DWORD  RECOIL_DIR_CHANGE_MS = 40;  // how often direction randomizes (same as ambient)
+static double RECOIL_X_SCALE = 20.0;      // backwards kick strength
+static double RECOIL_RELEASE_HZ = 12.0;   // release shaping: low-pass cutoff for the recoil push on the way DOWN only. Higher = sharper release, lower = smoother/longer. (Up-edges pass instantly so the kick stays crisp.)
+static double RECOIL_VERTICAL = 10.0;  // upward force as fraction of recoil (0=none, 1=equal to X)
+//static double RECOIL_Z_RETURN_RATE = 0.2;  // how fast debt bleeds back (higher = snappier return)
+static double EDGE_THRESHOLD = 2.0;  //how much of a rising edge is considered a new impulse
 
-static const double RECOIL_TOPUP_BLEND = 0.6;   // how much of new peak boosts current force
-static const double RECOIL_YZ_ONSET_N = 2;     // how many rapid shots before Y/Z texture starts
-static const double RECOIL_YZ_DECAY = 0.15;  // how fast Y/Z texture fades between shots
-static const double RECOIL_YZ_SCALE = 0.15;   // Y/Z texture strength
-static const double RECOIL_YZ_DIR_SLEW_HZ = 6.0;  // how fast lateral texture direction eases toward target while active (lower = smoother)
-static const double RECOIL_YZ_GATE_HI = 0.8;      // incoming-rumble level that TURNS ON the lateral texture (strong rumble / the kick only)
-static const double RECOIL_YZ_GATE_LO = 0.5;      // level that TURNS OFF (hysteresis) — texture cuts before the weak decay tail to prevent jagged release
-static const double RECOIL_YZ_SMOOTH_HZ = 18.0;   // de-jags the active texture (follows packet steps smoothly instead of nudging per packet)
-static const double RECOIL_YZ_CUT_HZ = 45.0;      // fast hard-cut once the gate fails
-static const DWORD  RUMBLE_FRESH_MS = 40;         // a rumble packet must have arrived within this window to count as live; then clean release
+static double RECOIL_TOPUP_BLEND = 0.6;   // how much of new peak boosts current force
+static double RECOIL_YZ_ONSET_N = 2;     // how many rapid shots before Y/Z texture starts
+static double RECOIL_YZ_DECAY = 0.15;  // how fast Y/Z texture fades between shots
+static double RECOIL_YZ_SCALE = 0.15;   // Y/Z texture strength
+static double RECOIL_YZ_DIR_SLEW_HZ = 6.0;  // how fast lateral texture direction eases toward target while active (lower = smoother)
+static double RECOIL_YZ_GATE_HI = 0.8;      // incoming-rumble level that TURNS ON the lateral texture (strong rumble / the kick only)
+static double RECOIL_YZ_GATE_LO = 0.5;      // level that TURNS OFF (hysteresis) — texture cuts before the weak decay tail to prevent jagged release
+static double RECOIL_YZ_SMOOTH_HZ = 18.0;   // de-jags the active texture (follows packet steps smoothly instead of nudging per packet)
+static double RECOIL_YZ_CUT_HZ = 45.0;      // fast hard-cut once the gate fails
+static DWORD  RUMBLE_FRESH_MS = 40;         // a rumble packet must have arrived within this window to count as live; then clean release
+
+// ── Rumble AGC: auto-normalize per-game rumble level ─────────────────────────
+// Games report wildly different rumble amplitudes. The AGC tracks a slow running
+// average of incoming magnitude and gains packets so that average sits at
+// AGC_TARGET:   out = AGC_TARGET * (in / avg)^AGC_DYNAMICS
+// DYNAMICS=1 is a pure level shift — every ratio is preserved, so strong shots
+// keep their full separation from weak tails, just referenced to a common level.
+// Applied at ingestion (inL/inS), so ALL downstream thresholds (recoil sustain,
+// YZ gates, ambient quiet) compare against normalized units across titles.
+static bool   AGC_ENABLE = false;  // master switch — off = raw passthrough, identical to previous behavior
+static double AGC_TARGET = 0.5;    // rawMag level the running average is pulled to
+static double AGC_ADAPT_SEC = 10.0;// adaptation time constant (s) — how fast "average" follows the game
+static double AGC_FLOOR = 0.05;    // packets below this rawMag don't teach the average (silence must not drag it down)
+static double AGC_GAIN_MIN = 0.33; // gain clamp — a loud game is attenuated at most this far
+static double AGC_GAIN_MAX = 3.0;  // gain clamp — a quiet game's noise floor can't be amplified into phantom recoil
+static double AGC_DYNAMICS = 1.0;  // 1 = ratios preserved exactly; >1 expands kick/tail separation; <1 compresses
+static double AGC_TOLERANCE = 1.5; // dead band ratio: averages within TARGET/x .. TARGET*x are left RAW (gain 1). Outside, correction pulls the level to the band EDGE (not the center) so it engages smoothly with no jump at the threshold. 1.0 = always correct (old behavior)
+static volatile double g_agcAvg = 0.0;  // learned average (0 = unseeded; first qualifying packet seeds it)
+
+
+// ── Config file ──────────────────────────────────────────────────────────────
+// falcon_config.txt is loaded at startup (and on F8). If the file doesn't exist,
+// a template populated with all current defaults is written next to the exe.
+// Format:  NAME = value      ('#' and '//' start comments; blank lines ignored)
+// A different config can be given as the first command-line argument, e.g.
+//   FalconJoyForce.exe destiny.txt
+// which enables per-title profiles; F8 reloads whichever file was loaded.
+static char g_configPath[MAX_PATH] = "falcon_config.txt";
+
+enum CfgType { CFG_DBL, CFG_INT, CFG_DWORD, CFG_BOOL, CFG_STR, CFG_SECTION };
+struct CfgEntry { const char* name; CfgType type; void* ptr; size_t strCap; const char* comment; };
+
+#define C_D(x, c) { #x, CFG_DBL,     (void*)&x, 0,         c }
+#define C_I(x, c) { #x, CFG_INT,     (void*)&x, 0,         c }
+#define C_U(x, c) { #x, CFG_DWORD,   (void*)&x, 0,         c }
+#define C_B(x, c) { #x, CFG_BOOL,    (void*)&x, 0,         c }
+#define C_S(x, c) { #x, CFG_STR,     (void*)&x, sizeof(x), c }
+#define SEC(t)    { t,  CFG_SECTION, NULL,      0,         NULL }
+
+static CfgEntry g_cfgTable[] = {
+    SEC("Serial / loop"),
+    C_S(SERIAL_PORT,        "COM port device path (\\\\.\\COMn) -- restart required"),
+    C_U(SERIAL_BAUD,        "baud rate -- restart required"),
+    C_D(SERIAL_SEND_MS,     "controller packet interval (ms); 2 = 500Hz; button changes always send immediately"),
+    C_I(UPDATE_RATE_MS,     "0 = unpaced, USB throttles loop to ~1000Hz; >=1 = precise QPC pacing to that period (ms)"),
+    C_B(INVERT_X,           "flip stick X output"),
+    C_B(INVERT_Y,           "flip stick Y output"),
+
+    SEC("Velocity zones (aim response)"),
+    C_D(VEL_DEADZONE,       "m/s below which velocity produces no stick output"),
+    C_D(VEL_VLOW_SENS,      "sensitivity for very slow corrections"),
+    C_D(VEL_VLOW_CURVE,     "closer to 1.0 = more linear, less boosted"),
+    C_D(VEL_LOW_SENS,       "sensitivity at low speeds"),
+    C_D(VEL_LOW_CURVE,      "curve for slow zone (lower = more boost)"),
+    C_D(VEL_HIGH_SENS,      "sensitivity at high speeds"),
+    C_D(VEL_HIGH_CURVE,     "curve for fast zone (1.0 = linear)"),
+    C_D(VEL_BLEND_VLOW,     "m/s -- below this = pure vlow zone"),
+    C_D(VEL_BLEND_LOW,      "m/s -- below this = low speed zone"),
+    C_D(VEL_BLEND_HIGH,     "m/s -- above this = high speed zone"),
+    C_D(SOFT_RAMP,          "m/s width of the ramp out of the deadzone"),
+    C_D(SHORT_VEL_NOISE,    "higher suppresses more low-speed noise"),
+    C_D(VEL_VLOW_POS_SCALE, "position-error assist scale at ultra-low speed"),
+    C_D(VEL_RELEASE_MULT,   "decel cutoff multiplier -- higher = snappier stop, lower = floatier"),
+    C_D(VEL_VERTICAL_SCALE, "Z-axis (up/down) velocity-zone output multiplier; Y unaffected"),
+
+    SEC("Velocity estimator internals"),
+    C_D(VEL_FC_VLOW,        "smoothing cutoff Hz in vlow bracket -- higher = less latency, more jitter"),
+    C_D(VEL_FC_LOW,         "cutoff Hz at VEL_BLEND_LOW (smoothstepped from VEL_FC_VLOW)"),
+    C_D(VEL_FC_HIGH,        "cutoff Hz at VEL_BLEND_HIGH"),
+    C_D(VEL_FC_MAX,         "cutoff Hz at VEL_FC_SPEED_CEIL (fast motion = nearly raw)"),
+    C_D(SLOWREF_HZ,         "drift rate of the slowRef low-pass (PosError anchor)"),
+    C_I(VEL_WINDOW_SAMPLES, "velocity averaging window, 2..8 samples (= that many ms at 1kHz)"),
+    C_I(VEL_ZERO_FRAMES,    "consecutive sub-deadzone frames before smoothVel hard-zeros"),
+    C_D(POSBLEND_MAX_MULT,  "posBlendMax = VEL_BLEND_LOW * this -- speed below which position assist blends in"),
+    C_D(POSBLEND_SLEW_HZ,   "slew on the position-blend amount -- one-frame dips can't snap it"),
+
+    SEC("Flick capture"),
+    C_D(FLICK_VEL_ON,       "m/s above which motion is banked as a flick (~ where the stick saturates)"),
+    C_D(FLICK_GAIN,         "how much banked over-speed becomes extra deflection"),
+    C_D(FLICK_DECAY,        "PER-MS decay of the carry tail -- lower = shorter tail"),
+    C_D(FLICK_CARRY_MAX,    "clamp on carry deflection so big flicks don't over-throw"),
+
+    SEC("Push zone"),
+    C_D(PUSH_ENTER_RAD,     "fraction of work radius where push zone kicks in"),
+    C_D(PUSH_EXIT_RAD,      "fraction of work radius where push zone stops acting"),
+    C_D(PUSH_SPEED_BASE,    "cursor speed on entering push zone"),
+    C_D(PUSH_SPEED_MAX,     "maximum push speed at full tilt"),
+    C_D(PUSH_VERTICAL_SCALE,"Z-axis push-speed multiplier; Y unaffected"),
+    C_D(HALF_RANGE_MAX,     "work radius (m) -- takes effect on next F11 recalibrate"),
+    C_D(VEL_FC_SPEED_CEIL,  "velocity ceiling (m/s) for the top smoothing bracket -- NOT the work area"),
+    C_D(CALIB_FILL,         "fraction of measured reach mapping to full deflection"),
+    C_D(CALIB_MIN,          "reject implausibly small calibration sweeps (m)"),
+    C_D(CALIB_MAX,          "reject implausibly large calibration sweeps (m)"),
+    C_D(PUSH_DAMP_COEFF,    "stick damping strength on push-zone direction reversal (0=none, 1=strong)"),
+    C_D(PUSH_DAMP_DECAY,    "how quickly reversal damping fades (higher = faster)"),
+
+    SEC("Boundary detent & exit pump"),
+    C_D(DETENT_WIDTH,       "fraction of work radius over which the ridge builds"),
+    C_D(DETENT_PEAK_N,      "ridge height (N) -- resistance grows, then releases at the push threshold"),
+    C_D(DETENT_VEL_HYST,    "m/s radial-direction threshold -- arms moving out, suppresses moving back in"),
+    C_D(DETENT_VOUT_HZ,     "low-pass on the ARMING signal only (not the force); lower = steadier latch, lazier reversal release"),
+    C_D(EDGE_HYST,          "spatial hysteresis (fraction of work radius) on the border pop latch; stops edge wobble strobing the ridge/pump"),
+    C_D(PUMP_PEAK_N,        "inward kick strength (N) crossing back out of push"),
+    C_D(PUMP_DECAY,         "PER-MS decay of the kick -- lower = snappier/shorter pump"),
+
+    SEC("Friction / stiction compensation"),
+    C_D(FRICTION_CANCEL,    "Coulomb feed-forward force (N) along motion"),
+    C_D(FRICTION_VEL_MIN,   "m/s where assist engages"),
+    C_D(FRICTION_VEL_FULL,  "m/s where assist reaches full (fixed window, not tied to MIN)"),
+    C_D(FRICTION_VEL_MAX,   "m/s by which assist has faded back out"),
+    C_D(STICTION_BREAK_N,   "constant breakaway force (N)"),
+    C_D(STICTION_VEL_ON,    "motion floor for breakaway (= SHORT_VEL_NOISE)"),
+    C_D(VISCOUS_CANCEL,     "N per m/s -- cancels speed-proportional drag. 0=off; start ~1.0; too high = self-driving"),
+    C_D(VISCOUS_MAX_N,      "hard cap on viscous assist (safety against runaway)"),
+    C_D(DITHER_N,           "stiction dither amplitude (N). 0=off; try 0.05-0.12; lower if crosshair jitters"),
+    C_D(DITHER_HZ,          "dither frequency -- high enough not to read as motion"),
+    C_D(DITHER_VEL_FADE,    "m/s above which dither is fully faded out"),
+
+    SEC("Button 2 brace / preload"),
+    C_D(BTN2_X_FORCE,       "constant X force while button 2 held (N) -- preloads mechanism for fine corrections"),
+    C_D(BTN2_X_SIGN,        "+1 or -1 to flip preload direction"),
+
+    SEC("Spring wall"),
+    C_D(FORCE_SPRING_START, "fraction of work radius where spring force starts"),
+    C_D(FORCE_MAX_RAD,      "fraction of work radius where max force is reached"),
+    C_D(FORCE_MAX_N,        "maximum wall force (N)"),
+    C_D(FORCE_DAMPING,      "bidirectional radial damping -- removes wall-contact buzz energy; higher = deader wall"),
+    C_D(FORCE_EXPONENT,     "force ramp shape -- lower = builds earlier and harder"),
+    C_D(DAMP_VEL_MIN,       "m/s below which no ENHANCED damping (base FORCE_DAMPING always active)"),
+    C_D(DAMP_VEL_MAX,       "m/s above which full enhanced damping (smoothstepped)"),
+    C_D(FORCE_YZ_CAP_N,     "hard cap on combined Y/Z force (spring + lateral rumble)"),
+
+    SEC("Gravity compensation"),
+    C_D(GRAVITY_COMP_SCALE, "1.0 = physical; >1 preloads joints upward and adds asymmetric drag"),
+
+    SEC("Ambient rumble"),
+    C_D(AMBIENT_LARGE_SCALE,  "large-motor ambient force scale"),
+    C_D(AMBIENT_SMALL_SCALE,  "small-motor ambient force scale"),
+    C_D(RUMBLE_DECAY,         "PER-MS retention of incoming rumble (0.70/ms ~= old 0.60/frame at 700Hz)"),
+    C_D(RUMBLE_FORCE_SCALE,   "overall scale factor of rumble force"),
+    C_D(AMBIENT_TAIL_QUIET,   "ambient held off until incoming rumble decays below this (adapts to shot size)"),
+    C_U(AMBIENT_DIR_CHANGE_MS,"ms between new ambient target directions"),
+    C_D(AMBIENT_DIR_SLEW_HZ,  "how fast ambient direction eases toward its target"),
+    C_D(AMBIENT_ATTACK_HZ,    "ambient magnitude ramp-up cutoff"),
+    C_D(AMBIENT_RELEASE_HZ,   "ambient magnitude ramp-down cutoff (slower = softer fade)"),
+
+    SEC("Recoil"),
+    C_D(RUMBLE_LARGE_SCALE,   "recoil scale for large-motor rumble"),
+    C_D(RUMBLE_SMALL_SCALE,   "recoil scale for small-motor rumble"),
+    C_U(RECOIL_WINDOW_MS,     "ms after btn1 release to still catch trigger recoil -- shorter = snappier, <100 may miss single shots"),
+    C_D(RECOIL_SUSTAIN_THRESHOLD, "liveMag above this = still firing; PRIMARY per-title linger knob -- raise so weak tail packets can't sustain"),
+    C_D(RECOIL_CURVE,         "recoil compressor -- 0.3 boosts small recoils; 1.0 = linear"),
+    C_D(RECOIL_DECAY,         "initial per-ms decay (overwritten per shot by MIN..MAX mapping)"),
+    C_D(RECOIL_DECAY_MIN,     "per-ms decay for weak shots (fast cutoff)"),
+    C_D(RECOIL_DECAY_MAX,     "per-ms decay for strong shots (long sustain)"),
+    C_D(RECOIL_MAG_SCALE,     "liveMag that maps to DECAY_MAX -- raise so fewer shots get the long sustain"),
+    C_D(RECOIL_AIM_DAMP,      "stick sensitivity multiplier during recoil (0=frozen, 1=no effect)"),
+    C_D(RECOIL_DAMP_DECAY,    "how fast aim damp fades per second -- raise if aim feels muddy after bursts"),
+    C_D(RECOIL_PUSH_SCALE,    "sustained push force multiplier"),
+    C_D(BLEED_Y_SCALE,        "velocity bleed: fraction of Y velocity gated at full recoil (settle suppression)"),
+    C_D(BLEED_Z_DOWN,         "stronger bleed on downward Z -- gravity is the main tail-drift cause"),
+    C_D(BLEED_Z_UP,           "lighter bleed on upward Z"),
+    C_D(RECOIL_ATTACK_SEC,    "attack envelope length (0 = instant kick)"),
+    C_U(MIN_EDGE_INTERVAL_MS, "minimum ms between edges counted as new impulses"),
+    C_U(RECOIL_DIR_CHANGE_MS, "ms between lateral texture direction randomizations"),
+    C_D(RECOIL_X_SCALE,       "backwards kick strength"),
+    C_D(RECOIL_RELEASE_HZ,    "down-ramp low-pass; higher = sharper release (past ~30 the sawtooth buzz returns); up-edges pass instantly"),
+    C_D(RECOIL_VERTICAL,      "upward force as fraction of recoil (0=none)"),
+    C_D(EDGE_THRESHOLD,       "rising-edge size considered a new impulse"),
+    C_D(RECOIL_TOPUP_BLEND,   "how much of a new peak boosts current force"),
+    C_D(RECOIL_YZ_ONSET_N,    "rapid shots before Y/Z texture starts"),
+    C_D(RECOIL_YZ_DECAY,      "how fast Y/Z texture fades between shots"),
+    C_D(RECOIL_YZ_SCALE,      "Y/Z texture strength"),
+    C_D(RECOIL_YZ_DIR_SLEW_HZ,"lateral texture direction slew while active (lower = smoother)"),
+    C_D(RECOIL_YZ_GATE_HI,    "incoming level that turns lateral texture ON (the strong kick only)"),
+    C_D(RECOIL_YZ_GATE_LO,    "level that turns it OFF (hysteresis) -- cuts before the weak tail to prevent jagged release"),
+    C_D(RECOIL_YZ_SMOOTH_HZ,  "de-jags the active texture (follows packet steps smoothly)"),
+    C_D(RECOIL_YZ_CUT_HZ,     "fast hard-cut once the gate fails"),
+    C_U(RUMBLE_FRESH_MS,      "rumble packet must arrive within this window to count as live; then clean release"),
+
+    SEC("Rumble AGC (auto per-game normalization)"),
+    C_B(AGC_ENABLE,           "normalize each game's rumble level to AGC_TARGET; off = raw passthrough"),
+    C_D(AGC_TARGET,           "rawMag level the running average is pulled to -- all recoil/ambient thresholds then live in these units"),
+    C_D(AGC_ADAPT_SEC,        "adaptation time constant (s); first shot seeds instantly, then average follows at this rate"),
+    C_D(AGC_FLOOR,            "packets below this don't teach the average (silence must not drag it down)"),
+    C_D(AGC_GAIN_MIN,         "gain clamp -- loud games attenuated at most this far"),
+    C_D(AGC_GAIN_MAX,         "gain clamp -- quiet games amplified at most this far (keeps noise floor from becoming phantom recoil)"),
+    C_D(AGC_DYNAMICS,         "1 = ratios preserved exactly; >1 expands kick/tail separation; <1 compresses"),
+    C_D(AGC_TOLERANCE,        "dead band: averages within TARGET/x..TARGET*x stay raw; outside, level pulled to the band edge. 1.0 = always correct"),
+};
+static const int g_cfgCount = (int)(sizeof(g_cfgTable) / sizeof(g_cfgTable[0]));
+
+static void CfgTrim(char* s) {
+    char* p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = 0;
+}
+
+static void CfgWriteEntry(FILE* f, const CfgEntry& e) {
+    if (e.type == CFG_SECTION) {
+        fprintf(f, "\n# ---------- %s ----------\n", e.name);
+        return;
+    }
+    char val[128];
+    switch (e.type) {
+    case CFG_DBL:   snprintf(val, sizeof(val), "%g", *(double*)e.ptr); break;
+    case CFG_INT:   snprintf(val, sizeof(val), "%d", *(int*)e.ptr); break;
+    case CFG_DWORD: snprintf(val, sizeof(val), "%lu", (unsigned long)(*(DWORD*)e.ptr)); break;
+    case CFG_BOOL:  snprintf(val, sizeof(val), "%s", *(bool*)e.ptr ? "true" : "false"); break;
+    case CFG_STR:   snprintf(val, sizeof(val), "%s", (char*)e.ptr); break;
+    default:        val[0] = 0; break;
+    }
+    if (e.comment && *e.comment)
+        fprintf(f, "%-26s = %-10s # %s\n", e.name, val, e.comment);
+    else
+        fprintf(f, "%-26s = %s\n", e.name, val);
+}
+
+static void WriteConfigTemplate(const char* path) {
+    FILE* f = fopen(path, "w");
+    if (!f) { printf("Config: could not write template %s\n", path); return; }
+    fprintf(f, "# FalconJoyForce configuration\n");
+    fprintf(f, "# Edit values and restart, or press F8 in the running program to reload live.\n");
+    fprintf(f, "# Anything after '#' or '//' is a comment. Missing keys keep their compiled defaults.\n");
+    for (int i = 0; i < g_cfgCount; i++) CfgWriteEntry(f, g_cfgTable[i]);
+    fclose(f);
+    printf("Config: wrote template with defaults -> %s\n", path);
+}
+
+static bool LoadConfig(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        printf("Config: %s not found, using compiled defaults.\n", path);
+        WriteConfigTemplate(path);
+        return false;
+    }
+    char line[512];
+    int applied = 0;
+    bool present[sizeof(g_cfgTable) / sizeof(g_cfgTable[0])] = {};
+    while (fgets(line, sizeof(line), f)) {
+        char* c = strchr(line, '#');   if (c) *c = 0;   // strip comments
+        c = strstr(line, "//");        if (c) *c = 0;
+        char* eq = strchr(line, '=');  if (!eq) continue;
+        *eq = 0;
+        char* key = line;
+        char* val = eq + 1;
+        CfgTrim(key); CfgTrim(val);
+        if (!*key || !*val) continue;
+
+        bool found = false;
+        for (int i = 0; i < g_cfgCount; i++) {
+            CfgEntry& e = g_cfgTable[i];
+            if (e.type == CFG_SECTION) continue;
+            if (_stricmp(e.name, key) != 0) continue;
+            found = true;
+            switch (e.type) {
+            case CFG_DBL:   *(double*)e.ptr = atof(val); break;
+            case CFG_INT:   *(int*)e.ptr = atoi(val); break;
+            case CFG_DWORD: *(DWORD*)e.ptr = (DWORD)strtoul(val, NULL, 10); break;
+            case CFG_BOOL:  *(bool*)e.ptr = (_stricmp(val, "true") == 0 || _stricmp(val, "1") == 0
+                || _stricmp(val, "yes") == 0 || _stricmp(val, "on") == 0); break;
+            case CFG_STR:   strncpy((char*)e.ptr, val, e.strCap - 1);
+                ((char*)e.ptr)[e.strCap - 1] = 0; break;
+            }
+            applied++;
+            present[i] = true;
+            break;
+        }
+        if (!found) printf("Config: unknown key '%s' (ignored)\n", key);
+    }
+    fclose(f);
+    printf("Config: %d value(s) loaded from %s\n", applied, path);
+    int missing = 0;
+    for (int i = 0; i < g_cfgCount; i++)
+        if (g_cfgTable[i].type != CFG_SECTION && !present[i]) missing++;
+    if (missing > 0) {
+        printf("Config: %d key(s) not in file (compiled defaults in effect):\n  ", missing);
+        int shown = 0;
+        for (int i = 0; i < g_cfgCount; i++) {
+            if (g_cfgTable[i].type == CFG_SECTION || present[i]) continue;
+            printf("%s%s", shown++ ? ", " : "", g_cfgTable[i].name);
+        }
+        printf("\n  (rename the file and rerun to generate a complete template, then merge your tuned values)\n");
+    }
+    return true;
+}
+
+// Anything derived from config values goes here — called after every (re)load.
+static void ApplyDerivedConfig() {
+    posBlendMax = VEL_BLEND_LOW * POSBLEND_MAX_MULT;
+    if (VEL_WINDOW_SAMPLES < 2) VEL_WINDOW_SAMPLES = 2;   // history arrays are sized 8 —
+    if (VEL_WINDOW_SAMPLES > 8) VEL_WINDOW_SAMPLES = 8;   // clamp so indexing can never overrun
+    if (VEL_ZERO_FRAMES < 1) VEL_ZERO_FRAMES = 1;
+}
 
 
 // ── Recoil impulse queue ───────────────────────────────────────────────────
@@ -194,6 +547,7 @@ static bool   g_recoilTailActive = false;  // true while a recoil's rumble tail 
 static DWORD  g_lastYZDirChange = 0;
 static double          g_recoilDecay = 0.55;
 static volatile bool   g_running = true;
+static volatile bool   g_debugMode = false;   // shared with serial thread so RAW prints don't fight the status line
 static volatile uint8_t g_btnMask = 0;
 static volatile uint8_t g_dhdButtons = 0;
 //static volatile DWORD  g_lastRumbleTime = 0;
@@ -244,15 +598,57 @@ static DWORD WINAPI SerialReaderThread(LPVOID) {
             if ((buf[1] ^ buf[2]) == buf[3]) {
                 float inL = buf[1] / 255.0f;
                 float inS = buf[2] / 255.0f;
+                double rawMag = (inL * 1.0 + inS * 0.5);
+                double preMag = rawMag;   // pre-AGC, for the debug readout
+
+                // ── Rumble AGC ────────────────────────────────────────────────
+                // Teach the running average (loud-enough packets only, time-based
+                // rate), then gain this packet so the game's average level lands
+                // on AGC_TARGET. Both motors share one gain so their ratio holds.
+                if (AGC_ENABLE && rawMag > 1e-6) {
+                    if (rawMag > AGC_FLOOR) {
+                        static DWORD lastTeach = 0;
+                        DWORD nowT = GetTickCount();
+                        double dtp = (lastTeach == 0) ? 0.0 : (nowT - lastTeach) / 1000.0;
+                        if (dtp > 0.5) dtp = 0.5;   // long silences don't cause a giant step
+                        lastTeach = nowT;
+                        if (g_agcAvg <= 0.0) g_agcAvg = rawMag;   // first shot seeds instantly
+                        else {
+                            double a = 1.0 - exp(-dtp / AGC_ADAPT_SEC);
+                            g_agcAvg += a * (rawMag - g_agcAvg);
+                        }
+                    }
+                    if (g_agcAvg > 1e-6) {
+                        // Dead band: inside TARGET/TOL..TARGET*TOL the effective
+                        // target IS the learned average → gain 1, raw passthrough.
+                        // Outside, effTarget clamps to the band edge, so correction
+                        // only removes the excess beyond "reasonable" and shrinks
+                        // smoothly to zero as a game approaches the band.
+                        double tol = (AGC_TOLERANCE < 1.0) ? 1.0 : AGC_TOLERANCE;
+                        double lo = AGC_TARGET / tol;
+                        double hi = AGC_TARGET * tol;
+                        double effTarget = g_agcAvg < lo ? lo : (g_agcAvg > hi ? hi : g_agcAvg);
+                        double norm = effTarget * pow(rawMag / g_agcAvg, AGC_DYNAMICS);
+                        double gain = norm / rawMag;
+                        if (gain < AGC_GAIN_MIN) gain = AGC_GAIN_MIN;
+                        if (gain > AGC_GAIN_MAX) gain = AGC_GAIN_MAX;
+                        inL = (float)(inL * gain);
+                        inS = (float)(inS * gain);
+                        rawMag *= gain;
+                    }
+                }
+
                 if (inL > g_rumbleLarge) g_rumbleLarge = inL;
                 if (inS > g_rumbleSmall) g_rumbleSmall = inS;
                 g_rumbleLargePeak = inL;   // ← raw peak, no decay
                 g_rumbleSmallPeak = inS;
-                double rawMag = (inL * 1.0 + inS * 0.5);
-                static DWORD lastRawPrint = 0;
-                if (GetTickCount() - lastRawPrint > 100) {
-                    lastRawPrint = GetTickCount();
-                    printf("\nRAW: L=%.3f S=%.3f mag=%.3f\n", inL, inS, rawMag);
+                if (g_debugMode) {   // console I/O from this thread contends the main status line — debug only
+                    static DWORD lastRawPrint = 0;
+                    if (GetTickCount() - lastRawPrint > 100) {
+                        lastRawPrint = GetTickCount();
+                        printf("\nRAW: L=%.3f S=%.3f mag=%.3f (pre-AGC=%.3f avg=%.3f)\n",
+                            inL, inS, rawMag, preMag, g_agcAvg);
+                    }
                 }
                 double newRecoil = pow(rawMag, RECOIL_CURVE) * RUMBLE_FORCE_SCALE * FORCE_MAX_N;
                 RecoilEnqueue(newRecoil);
@@ -290,7 +686,7 @@ struct AxisState {
     double slowRef = 0.0;
     bool   slowRefSeeded = false;
 
-    static const int VEL_WINDOW = 6;
+    // window length is the global VEL_WINDOW_SAMPLES (config, 2..8); arrays fixed at 8
     double posHistory[8] = {};
     double timeHistory[8] = {};
     int    posIdx = 0;
@@ -304,7 +700,7 @@ struct AxisState {
 
     void UpdateSlowRef(double pos, double dt) {
         if (!slowRefSeeded) { slowRef = pos; slowRefSeeded = true; return; }
-        double alpha = 1.0 - exp(-2.0 * 3.14159265 * 1.2 * dt);  // was 2.0Hz, now 1.2Hz
+        double alpha = 1.0 - exp(-2.0 * 3.14159265 * SLOWREF_HZ * dt);
         slowRef += alpha * (pos - slowRef);
     }
 
@@ -316,7 +712,7 @@ struct AxisState {
 
     void UpdateVelocity(double pos, double dt) {
         if (!posSeeded) {
-            for (int i = 0; i < VEL_WINDOW; i++) {
+            for (int i = 0; i < VEL_WINDOW_SAMPLES; i++) {
                 posHistory[i] = pos;
                 timeHistory[i] = dt > 0.0 ? dt : 0.001;
             }
@@ -325,16 +721,16 @@ struct AxisState {
 
         posHistory[posIdx] = pos;
         timeHistory[posIdx] = dt > 0.0 ? dt : 0.001;
-        posIdx = (posIdx + 1) % VEL_WINDOW;
+        posIdx = (posIdx + 1) % VEL_WINDOW_SAMPLES;
 
         double oldPos = posHistory[posIdx];
         double elapsed = 0.0;
-        for (int i = 0; i < VEL_WINDOW; i++) elapsed += timeHistory[i];
+        for (int i = 0; i < VEL_WINDOW_SAMPLES; i++) elapsed += timeHistory[i];
         double avgVel = (elapsed > 0.0001) ? (pos - oldPos) / elapsed : 0.0;
 
-        int prev2 = (posIdx + VEL_WINDOW - 2) % VEL_WINDOW;
-        double t2 = timeHistory[(posIdx + VEL_WINDOW - 1) % VEL_WINDOW]
-            + timeHistory[(posIdx + VEL_WINDOW - 2) % VEL_WINDOW];
+        int prev2 = (posIdx + VEL_WINDOW_SAMPLES - 2) % VEL_WINDOW_SAMPLES;
+        double t2 = timeHistory[(posIdx + VEL_WINDOW_SAMPLES - 1) % VEL_WINDOW_SAMPLES]
+            + timeHistory[(posIdx + VEL_WINDOW_SAMPLES - 2) % VEL_WINDOW_SAMPLES];
         double shortVel = (t2 > 0.0001) ? (pos - posHistory[prev2]) / t2 : 0.0;
 
         if (fabs(shortVel) > SHORT_VEL_NOISE && fabs(shortVel) > fabs(avgVel))
@@ -342,26 +738,26 @@ struct AxisState {
         else
             rawVel = avgVel;
 
-        //Alpha section - smoothing at each speed bracket
+        //Alpha section - smoothing at each speed bracket (cutoffs now configurable)
         double velSpeed = fabs(rawVel);
         double fc;
         if (velSpeed < VEL_BLEND_VLOW) {
-            fc = 9.0;   // was 5 — cuts latency from ~32ms to ~18ms
+            fc = VEL_FC_VLOW;
         }
         else if (velSpeed < VEL_BLEND_LOW) {
             double t = (velSpeed - VEL_BLEND_VLOW) / (VEL_BLEND_LOW - VEL_BLEND_VLOW);
             t = t * t * (3.0 - 2.0 * t);
-            fc = 9.0 + (18.0 - 9.0) * t;    // was 3->8
+            fc = VEL_FC_VLOW + (VEL_FC_LOW - VEL_FC_VLOW) * t;
         }
         else if (velSpeed < VEL_BLEND_HIGH) {
             double t = (velSpeed - VEL_BLEND_LOW) / (VEL_BLEND_HIGH - VEL_BLEND_LOW);
             t = t * t * (3.0 - 2.0 * t);
-            fc = 18.0 + (30.0 - 18.0) * t;  // was 8->15
+            fc = VEL_FC_LOW + (VEL_FC_HIGH - VEL_FC_LOW) * t;
         }
         else {
             double t = (velSpeed - VEL_BLEND_HIGH) / (VEL_FC_SPEED_CEIL - VEL_BLEND_HIGH);
             t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
-            fc = 30.0 + (55.0 - 30.0) * t;  // was 15->30
+            fc = VEL_FC_HIGH + (VEL_FC_MAX - VEL_FC_HIGH) * t;
         }
         double fcRel = fc;
         if (fabs(rawVel) < fabs(smoothVel)) fcRel = fc * VEL_RELEASE_MULT; // decelerating → collapse faster
@@ -370,7 +766,7 @@ struct AxisState {
 
         if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE * 2.0) {
             zeroCount++;
-            if (zeroCount > 10) smoothVel = 0.0;
+            if (zeroCount > VEL_ZERO_FRAMES) smoothVel = 0.0;
         }
         else {
             zeroCount = 0;
@@ -488,21 +884,30 @@ static void ApplyForces(double y, double z,
         t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
         double mag = pow(t, FORCE_EXPONENT) * FORCE_MAX_N;
         double vOut = velY * dirY + velZ * dirZ; // outward velocity component
+        // Bidirectional radial damping. Previously damping only applied when vOut > 0,
+        // leaving the wall a completely UNDAMPED stiff spring on the inward half of
+        // every oscillation cycle — the classic buzzing virtual wall (a sampled spring
+        // injects a little energy each cycle; one-sided damping only removes it half
+        // the time). Base FORCE_DAMPING now acts on both signs of vOut: it resists
+        // compression on the way out (adds inward force) and resists retreat on the
+        // way in (reduces the push-back), which is what removes the oscillation energy.
+        // The outward-only proximity/velGate ENHANCED damping is unchanged.
+        double dynamicDamp = FORCE_DAMPING;
         if (vOut > 0.0) {
             double proximity = (r - FORCE_SPRING_START) / (PUSH_ENTER_RAD - FORCE_SPRING_START);
             proximity = proximity < 0.0 ? 0.0 : (proximity > 1.0 ? 1.0 : proximity);
 
             // Gate: only apply enhanced damping above a velocity threshold
-            static const double DAMP_VEL_MIN = 0.010; // below this = no enhanced damping
-            static const double DAMP_VEL_MAX = 0.020; // above this = full enhanced damping
+            // (DAMP_VEL_MIN/MAX are now config globals)
             double velMag = sqrt(velY * velY + velZ * velZ);
             double velGate = (velMag - DAMP_VEL_MIN) / (DAMP_VEL_MAX - DAMP_VEL_MIN);
             velGate = velGate < 0.0 ? 0.0 : (velGate > 1.0 ? 1.0 : velGate);
             velGate = velGate * velGate * (3.0 - 2.0 * velGate); // smoothstep
 
-            double dynamicDamp = FORCE_DAMPING * (1.0 + proximity * 2.0 * velGate);
-            mag += vOut * dynamicDamp;
+            dynamicDamp = FORCE_DAMPING * (1.0 + proximity * 2.0 * velGate);
         }
+        mag += vOut * dynamicDamp;
+        if (mag < 0.0) mag = 0.0;   // damping may reduce the wall force, never reverse it
         forceY = -dirY * mag;
         forceZ = -dirZ * mag;
     }
@@ -514,13 +919,40 @@ static void ApplyForces(double y, double z,
     // This is a direction switch, not a speed-proportional gate, so outward feel and
     // slow-approach crispness are untouched. Re-arms on every outward move, so repeated
     // border crossings stay crisp.
+    // Low-passed radial velocity — the detent latch's DECISION signal only.
+    // Raw vOut hovers around zero on a tangential slide along the wall; hand tremor
+    // crossing ±DETENT_VEL_HYST was flapping the armed latch and toggling the ridge
+    // force on/off at loop rate = buzz (unmasked by the true-dt timing fix — the old
+    // quantized dt froze the velocity filter on many frames and hid it). Updated every
+    // frame (not just inside the band) so it's never stale on band entry. The ridge
+    // FORCE is never filtered — outward pop stays crisp.
+    static double vOutSm = 0.0;
+    {
+        double vOutRaw = (r > 0.0001) ? (velY * (offY / r) + velZ * (offZ / r)) : 0.0;
+        double aVo = 1.0 - exp(-2.0 * 3.14159265 * DETENT_VOUT_HZ * dt);
+        vOutSm += aVo * (vOutRaw - vOutSm);
+    }
+
+    // ── Border pop latch (shared by ridge and pump) ──────────────────────────────
+    // The ridge cuts to zero exactly at PUSH_ENTER_RAD (the intended pop for a
+    // deliberate crossing) — but that is a position CLIFF with no width. Riding
+    // along the border, mm-level radial wobble strafes across it, square-waving the
+    // whole 1.6N wall on/off (the rumble) and opening force-free windows to slip
+    // through (the spring is only ~0.1N this shallow). The latch adds spatial
+    // hysteresis: crossing the border pops as before, but the popped state holds —
+    // ridge released, pump armed — until r retreats EDGE_HYST back inside. Riding
+    // the edge now sits cleanly in one state instead of strobing between them.
+    static bool edgePopped = false;
+    static bool edgePoppedPrev = false;
+    if (r >= PUSH_ENTER_RAD) edgePopped = true;
+    else if (r < PUSH_ENTER_RAD - EDGE_HYST) edgePopped = false;
+
     double detentStart = PUSH_ENTER_RAD - DETENT_WIDTH;        // ridge begins here
-    if (r > detentStart && r < PUSH_ENTER_RAD && r > 0.0001) {
+    if (!edgePopped && r > detentStart && r < PUSH_ENTER_RAD && r > 0.0001) {
         double dirY = offY / r, dirZ = offZ / r;
-        double vOut = velY * dirY + velZ * dirZ;               // + = moving outward, - = returning
         static int detentArmed = 1;                            // holds last clear direction (hysteresis)
-        if (vOut > DETENT_VEL_HYST) detentArmed = 1;          // moving out → arm
-        else if (vOut < -DETENT_VEL_HYST) detentArmed = 0;     // moving back in → suppress (kicks out at border)
+        if (vOutSm > DETENT_VEL_HYST) detentArmed = 1;         // moving out → arm
+        else if (vOutSm < -DETENT_VEL_HYST) detentArmed = 0;   // moving back in → suppress (kicks out at border)
         if (detentArmed) {
             double u = (r - detentStart) / DETENT_WIDTH;       // 0 at ridge start, 1 at push threshold
             u = u * u * (3.0 - 2.0 * u);                       // smoothstep — gentle build
@@ -530,15 +962,13 @@ static void ApplyForces(double y, double z,
         }
     }
 
-    // ── Exit pump — a brief inward kick right at the border when leaving push ─────
-    // Reproduces the "pump" the plain position detent gave on the way back in, but
-    // fired as a self-decaying impulse at the moment you cross out of push, so it
-    // lands on the border instead of lingering inward across the band.
-    static bool inPushZone = false;
+    // ── Exit pump — a brief inward kick when leaving the push border ──────────────
+    // Fires on the pop latch's release transition (r retreating EDGE_HYST back
+    // inside), so it lands once per genuine excursion instead of machine-gunning
+    // on border wobble like the old bare r >= PUSH_ENTER_RAD comparison did.
     static double pumpEnv = 0.0;
-    bool nowInPush = (r >= PUSH_ENTER_RAD);
-    if (inPushZone && !nowInPush) pumpEnv = 1.0;               // just dropped below the border → fire
-    inPushZone = nowInPush;
+    if (edgePoppedPrev && !edgePopped) pumpEnv = 1.0;          // genuine exit → fire once
+    edgePoppedPrev = edgePopped;
     if (pumpEnv > 0.01 && r > 0.0001) {
         double dirY = offY / r, dirZ = offZ / r;
         double kick = PUMP_PEAK_N * pumpEnv;
@@ -552,8 +982,10 @@ static void ApplyForces(double y, double z,
     forceZ += rumZ;
 
     // Friction cancellation
-    static const double FRICTION_VEL_MIN = 0.003;
-    static const double FRICTION_VEL_MAX = 0.08;
+    // NOTE: previously this block re-declared FRICTION_VEL_MIN/MAX as static const
+    // locals (0.003 / 0.08), silently shadowing the globals — the global values were
+    // never in effect. The shadows are removed; the globals (defaults set to the
+    // previously-effective values) now actually control this, including via config.
     double velMag = sqrt(velY * velY + velZ * velZ);
     if (velMag > FRICTION_VEL_MIN) {
         double fadeIn = fmin((velMag - FRICTION_VEL_MIN) / (FRICTION_VEL_FULL - FRICTION_VEL_MIN), 1.0);
@@ -569,11 +1001,41 @@ static void ApplyForces(double y, double z,
         forceZ += (velZ / velMag) * STICTION_BREAK_N;
     }
 
+    // Viscous cancellation — velocity-PROPORTIONAL assist (Coulomb can't cancel drag
+    // that grows with speed). Direction is automatic from the velocity sign. Capped
+    // at VISCOUS_MAX_N because this is deliberate negative damping: past the real
+    // drag coefficient it becomes energy injection.
+    if (VISCOUS_CANCEL > 0.0 && velMag > STICTION_VEL_ON) {
+        double vy = velY * VISCOUS_CANCEL;
+        double vz = velZ * VISCOUS_CANCEL;
+        double vmag = sqrt(vy * vy + vz * vz);
+        if (vmag > VISCOUS_MAX_N) { double s = VISCOUS_MAX_N / vmag; vy *= s; vz *= s; }
+        forceY += vy;
+        forceZ += vz;
+    }
+
+    // Stiction dither — small circular force at DITHER_HZ, full strength at rest and
+    // smoothstep-faded to zero by DITHER_VEL_FADE. Keeps the sleds in kinetic friction
+    // so there is no static re-grip at reversals or on the first mm of a correction.
+    // Circular (sin on Y, cos on Z) so it never biases a direction.
+    if (DITHER_N > 0.0) {
+        static double ditherPhase = 0.0;
+        ditherPhase += dt * DITHER_HZ * 2.0 * 3.14159265;
+        if (ditherPhase > 2.0 * 3.14159265 * 1000.0) ditherPhase -= 2.0 * 3.14159265 * 1000.0;
+        double fade = 1.0 - velMag / DITHER_VEL_FADE;
+        fade = fade < 0.0 ? 0.0 : (fade > 1.0 ? 1.0 : fade);
+        fade = fade * fade * (3.0 - 2.0 * fade);
+        if (fade > 0.0) {
+            forceY += DITHER_N * fade * sin(ditherPhase);
+            forceZ += DITHER_N * fade * cos(ditherPhase);
+        }
+    }
+
     // Cap X and YZ independently
     // X = recoil/rumble push, YZ = spring + lateral rumble
     double yzMag = sqrt(forceY * forceY + forceZ * forceZ);
-    if (yzMag > 7.8) {
-        double s = 7.8 / yzMag;
+    if (yzMag > FORCE_YZ_CAP_N) {
+        double s = FORCE_YZ_CAP_N / yzMag;
         forceY *= s;
         forceZ *= s;
     }
@@ -584,12 +1046,22 @@ static void ApplyForces(double y, double z,
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
-int main() {
+int main(int argc, char* argv[]) {
     InitializeCriticalSection(&g_recoilCS);
 
     printf("FalconJoyForce - Falcon -> Pico 2W (Serial) -> Xbox Controller\n\n");
 
-    printf("Opening %s at %d baud...\n", SERIAL_PORT, SERIAL_BAUD);
+    // Optional per-title profile: first argument overrides the config path
+    if (argc > 1) {
+        strncpy(g_configPath, argv[1], sizeof(g_configPath) - 1);
+        g_configPath[sizeof(g_configPath) - 1] = 0;
+    }
+
+    // Load config BEFORE anything uses the tunables (serial port, gravity, etc.)
+    LoadConfig(g_configPath);
+    ApplyDerivedConfig();
+
+    printf("Opening %s at %lu baud...\n", SERIAL_PORT, (unsigned long)SERIAL_BAUD);
     if (!SerialOpen(SERIAL_PORT, SERIAL_BAUD)) {
         printf("ERROR: Cannot open %s\n", SERIAL_PORT);
         printf("Check Device Manager -> Ports for the correct COM number.\n");
@@ -616,29 +1088,40 @@ int main() {
     printf("Falcon ready. SDK %s\n\n", dhdGetSDKVersionStr());
     printf("Serial: %s   Push zone: %.0f%%   Force max rad: %.2f\n",
         SERIAL_PORT, PUSH_ENTER_RAD * 100.0, FORCE_MAX_RAD);
-    printf("F9=quit  F10=debug  F11=recalibrate\n\n");
+    printf("F8=reload config  F9=quit  F10=debug  F11=recalibrate\n\n");
 
     AxisState   axY, axZ;
     PushState2D push;
 
+    // ── High-resolution timing ─────────────────────────────────────────────
+    // GetTickCount is 1ms-quantized: at ~1kHz that makes dt read 0/1/2ms at random,
+    // corrupting every frequency-based IIR filter. QPC gives sub-microsecond dt.
+    // GetTickCount() is kept for coarse ms timestamps (rumble freshness, UI).
+    LARGE_INTEGER qpf;   QueryPerformanceFrequency(&qpf);
+    LARGE_INTEGER qLast; QueryPerformanceCounter(&qLast);
+    LARGE_INTEGER qDeadline = qLast;
+    LONGLONG periodTicks = (UPDATE_RATE_MS > 0) ? (qpf.QuadPart * UPDATE_RATE_MS) / 1000 : 0;
+
     double rumblePhase = 0.0;
-    DWORD  lastFrame = GetTickCount();
     DWORD  lastStats = GetTickCount();
+    DWORD  lastKeyCheck = 0;      // GetAsyncKeyState throttle
     int    hz = 0;
-    bool   debugMode = false;
     bool   btn1WasHeld = false;
     g_btn1Released = GetTickCount();
 
-    double stickX = 0.0, stickY = 0.0;
+    double  serialAccumMs = 0.0;   // controller packet decimation
+    uint8_t lastSentBtnMask = 0;
+
     bool   recoilActive = false;
     bool   wasRecoilActive = false;
-    double stickScale = 1.0;
 
     while (true) {
-        DWORD  now = GetTickCount();
-        double dt = (now - lastFrame) / 1000.0;
+        LARGE_INTEGER qNow; QueryPerformanceCounter(&qNow);
+        double dt = (double)(qNow.QuadPart - qLast.QuadPart) / (double)qpf.QuadPart;
+        qLast = qNow;
+        if (dt <= 0.0) dt = 0.0005;
         if (dt > 0.05) dt = 0.01;
-        lastFrame = now;
+        DWORD now = GetTickCount();
 
         double x, y, z;
         if (dhdGetPosition(&x, &y, &z) < 0) { printf("Lost Falcon\n"); break; }
@@ -680,10 +1163,10 @@ int main() {
             bleedStrength = bleedStrength < 0.0 ? 0.0 : (bleedStrength > 1.0 ? 1.0 : bleedStrength);
             // Bias: specifically gate downward (negative Z) velocity harder than upward
             // since gravity is the primary cause of the tail drift
-            double bleedY = 1.0 - bleedStrength * 0.5;
+            double bleedY = 1.0 - bleedStrength * BLEED_Y_SCALE;
             double bleedZ = (axZ.smoothVel < 0.0)
-                ? 1.0 - bleedStrength * 0.8   // stronger bleed on downward motion
-                : 1.0 - bleedStrength * 0.4;  // lighter on upward
+                ? 1.0 - bleedStrength * BLEED_Z_DOWN   // stronger bleed on downward motion
+                : 1.0 - bleedStrength * BLEED_Z_UP;    // lighter on upward
             axY.smoothVel *= bleedY;
             axZ.smoothVel *= bleedZ;
         }
@@ -735,7 +1218,7 @@ int main() {
             posBlendRaw = posBlendRaw * posBlendRaw * (3.0 - 2.0 * posBlendRaw);
 
             static double posBlendSm = 0.0;  // slew-limited — a one-frame velMag dip can't snap this
-            double aPB = 1.0 - exp(-2.0 * 3.14159265 * 6.0 * dt);
+            double aPB = 1.0 - exp(-2.0 * 3.14159265 * POSBLEND_SLEW_HZ * dt);
             posBlendSm += aPB * (posBlendRaw - posBlendSm);
             double posBlend = posBlendSm;
 
@@ -818,7 +1301,7 @@ int main() {
             if (g_rapidShotCount > 0 || sustainingRumble)
                 liveYZMag = liveMag * RECOIL_YZ_SCALE;
             if (liveYZMag > g_recoilYZForce) g_recoilYZForce = liveYZMag;
-            g_recoilYZForce *= (float)RUMBLE_DECAY;
+            g_recoilYZForce *= pow(RUMBLE_DECAY, dt * 1000.0);   // dt-based (was per-frame)
             if (g_recoilYZForce < 0.01) g_recoilYZForce = 0.0;
 
             if (g_recoilYZForce > 0.01 && (now - g_lastYZDirChange) > RECOIL_DIR_CHANGE_MS) {
@@ -904,11 +1387,8 @@ int main() {
             static double tgtDirY = 1.0, tgtDirZ = 0.0;   // target direction
             static double rumMagSm = 0.0;                 // smoothed magnitude
             static DWORD  lastDirChange = 0;
-
-            static const DWORD  DIR_CHANGE = 140;     // ms between new target dirs (was 40)
-            static const double DIR_SLEW_HZ = 5.0;     // how fast dir eases toward target
-            static const double MAG_ATTACK_HZ = 7.0;     // ramp-up cutoff
-            static const double MAG_RELEASE_HZ = 3.0;     // ramp-down cutoff (slower = softer fade)
+            // envelope constants are now config globals: AMBIENT_DIR_CHANGE_MS,
+            // AMBIENT_DIR_SLEW_HZ, AMBIENT_ATTACK_HZ, AMBIENT_RELEASE_HZ
 
             double magTarget = (rL * AMBIENT_LARGE_SCALE + rS * AMBIENT_SMALL_SCALE);
 
@@ -918,7 +1398,7 @@ int main() {
             if (g_recoilTailActive) magTarget = 0.0;
 
             // pick a new target direction occasionally
-            if (now - lastDirChange > DIR_CHANGE) {
+            if (now - lastDirChange > AMBIENT_DIR_CHANGE_MS) {
                 lastDirChange = now;
                 double angle = ((rand() % 1000) / 1000.0) * 2.0 * 3.14159265;
                 tgtDirY = cos(angle);
@@ -926,14 +1406,14 @@ int main() {
             }
 
             // slew the actual direction toward the target, then renormalize
-            double aDir = 1.0 - exp(-2.0 * 3.14159265 * DIR_SLEW_HZ * dt);
+            double aDir = 1.0 - exp(-2.0 * 3.14159265 * AMBIENT_DIR_SLEW_HZ * dt);
             rumDirY += aDir * (tgtDirY - rumDirY);
             rumDirZ += aDir * (tgtDirZ - rumDirZ);
             double dlen = sqrt(rumDirY * rumDirY + rumDirZ * rumDirZ);
             if (dlen > 1e-6) { rumDirY /= dlen; rumDirZ /= dlen; }
 
             // attack/release low-pass on magnitude
-            double mhz = (magTarget > rumMagSm) ? MAG_ATTACK_HZ : MAG_RELEASE_HZ;
+            double mhz = (magTarget > rumMagSm) ? AMBIENT_ATTACK_HZ : AMBIENT_RELEASE_HZ;
             double aMag = 1.0 - exp(-2.0 * 3.14159265 * mhz * dt);
             rumMagSm += aMag * (magTarget - rumMagSm);
 
@@ -976,8 +1456,13 @@ int main() {
             }
         }
 
-        g_rumbleLarge = rL * (float)RUMBLE_DECAY;
-        g_rumbleSmall = rS * (float)RUMBLE_DECAY;
+        // dt-based rumble decay (was per-frame: feel changed with loop rate).
+        // RUMBLE_DECAY is now the per-millisecond retention factor.
+        {
+            float rumbleFrameDecay = (float)pow(RUMBLE_DECAY, dt * 1000.0);
+            g_rumbleLarge = rL * rumbleFrameDecay;
+            g_rumbleSmall = rS * rumbleFrameDecay;
+        }
 
         // ── Button 2: constant X preload to ease small corrections ───────────────────
         if (dhdGetButton(1) > 0) rumX += BTN2_X_SIGN * BTN2_X_FORCE;
@@ -990,22 +1475,32 @@ int main() {
         for (int i = 0; i < 4; i++)
             if (dhdGetButton(i) > 0) btnMask |= (1u << i);
 
-        // ── Send controller packet ─────────────────────────────────────────
+        // ── Send controller packet (decimated) ─────────────────────────────
+        // The haptic loop runs ~1kHz but the Pico/Xbox side samples far slower;
+        // writing 7 bytes over 115200-baud serial every frame both risks blocking
+        // in WriteFile and pushes the link near saturation. Send every
+        // SERIAL_SEND_MS instead — but flush immediately on any button change so
+        // button latency is unaffected.
         double stickScale = 1.0 - g_pushDamp;
         if (stickScale < 0.0) stickScale = 0.0;
         if (recoilActive)
             stickScale *= 1.0 - (1.0 - RECOIL_AIM_DAMP) * g_recoilDampEnv;
 
-        int16_t lx = ToStick(stickX * stickScale * (INVERT_X ? -1.0 : 1.0));
-        int16_t ly = ToStick(stickY * stickScale * (INVERT_Y ? -1.0 : 1.0));
-        SendControllerPacket(lx, ly, btnMask);
+        serialAccumMs += dt * 1000.0;
+        if (serialAccumMs >= SERIAL_SEND_MS || btnMask != lastSentBtnMask) {
+            serialAccumMs = 0.0;
+            int16_t lx = ToStick(stickX * stickScale * (INVERT_X ? -1.0 : 1.0));
+            int16_t ly = ToStick(stickY * stickScale * (INVERT_Y ? -1.0 : 1.0));
+            SendControllerPacket(lx, ly, btnMask);
+            lastSentBtnMask = btnMask;
+        }
 
         // ── Status display ─────────────────────────────────────────────────
         hz++;
         if (now - lastStats >= 1000) {
             int qcount = (g_recoilQHead - g_recoilQTail + RECOIL_QUEUE_SIZE) % RECOIL_QUEUE_SIZE;
             double r = sqrt(offY * offY + offZ * offZ);
-            if (debugMode) {
+            if (g_debugMode) {
                 printf("\nY: ctr=%+.4f half=%.4f off=%+.2f vel=%+.4f\n",
                     axY.estCenter, axY.halfRange, offY, axY.smoothVel);
                 printf("Z: ctr=%+.4f half=%.4f off=%+.2f vel=%+.4f\n",
@@ -1013,6 +1508,16 @@ int main() {
                 printf("r=%.3f  push=%s  damp=%.2f  stk=(%.2f,%.2f)  rbl=%.2f/%.2f  rcl=%.2f  q=%d  btn=%X\n",
                     r, inPush ? "YES" : "no", g_pushDamp, stickX, stickY,
                     rL, rS, g_recoilForce, qcount, btnMask);
+                if (AGC_ENABLE) {
+                    double tol = (AGC_TOLERANCE < 1.0) ? 1.0 : AGC_TOLERANCE;
+                    double lo = AGC_TARGET / tol, hi = AGC_TARGET * tol;
+                    bool inBand = (g_agcAvg >= lo && g_agcAvg <= hi);
+                    double eff = g_agcAvg < lo ? lo : (g_agcAvg > hi ? hi : g_agcAvg);
+                    double g = (g_agcAvg > 1e-6) ? eff / g_agcAvg : 1.0;
+                    g = g < AGC_GAIN_MIN ? AGC_GAIN_MIN : (g > AGC_GAIN_MAX ? AGC_GAIN_MAX : g);
+                    printf("agc: avg=%.3f band=%.3f..%.3f %s level-gain=%.2f\n",
+                        g_agcAvg, lo, hi, inBand ? "IN-BAND (raw)" : "correcting", g);
+                }
             }
             else {
                 int col = (int)((offY + 1.0) / 2.0 * 8.0 + 0.5);
@@ -1026,33 +1531,68 @@ int main() {
             hz = 0; lastStats = now;
         }
 
-        if (GetAsyncKeyState(VK_F9) & 0x8000) break;
-        if (GetAsyncKeyState(VK_F10) & 0x8000) {
-            debugMode = !debugMode;
-            printf("\nDebug %s\n", debugMode ? "ON" : "OFF");
-            Sleep(200);
-        }
-        if (GetAsyncKeyState(VK_F11) & 0x8000) {
-            printf("\nRecalibrating - move to ALL extremes for 4 seconds...\n");
-            axY = {}; axZ = {};
-            DWORD t1 = GetTickCount();
-            while (GetTickCount() - t1 < 4000) {
-                double rx, ry, rz;
-                if (dhdGetPosition(&rx, &ry, &rz) >= 0) { axY.UpdateReach(ry); axZ.UpdateReach(rz); }
-                Sleep(1);
+        // ── Keyboard (throttled — 3 GetAsyncKeyState syscalls/frame at 1kHz is waste) ──
+        if (now - lastKeyCheck >= 25) {
+            lastKeyCheck = now;
+            if (GetAsyncKeyState(VK_F9) & 0x8000) break;
+            if (GetAsyncKeyState(VK_F8) & 0x8000) {
+                printf("\nReloading %s...\n", g_configPath);
+                LoadConfig(g_configPath);
+                ApplyDerivedConfig();
+                dhdSetStandardGravity(9.81 * GRAVITY_COMP_SCALE);   // re-apply gravity comp
+                periodTicks = (UPDATE_RATE_MS > 0) ? (qpf.QuadPart * UPDATE_RATE_MS) / 1000 : 0;
+                QueryPerformanceCounter(&qDeadline);                // reset pacing baseline
+                printf("(HALF_RANGE_MAX / serial port changes need F11 recalibrate / restart)\n");
+                Sleep(200);
             }
-            double rawHalfY = (axY.absMax - axY.absMin) * 0.5;
-            double rawHalfZ = (axZ.absMax - axZ.absMin) * 0.5;
-            double fitY = rawHalfY * CALIB_FILL, fitZ = rawHalfZ * CALIB_FILL;
-            if (fitY >= CALIB_MIN && fitY <= CALIB_MAX) axY.halfRange = fitY;  // guard against a partial sweep
-            if (fitZ >= CALIB_MIN && fitZ <= CALIB_MAX) axZ.halfRange = fitZ;
-            double recommend = (axY.halfRange < axZ.halfRange) ? axY.halfRange : axZ.halfRange;
-            printf("Measured half-extent:  Y=%.4f m  Z=%.4f m\n", rawHalfY, rawHalfZ);
-            printf("Work area now:  Y half=%.4f  Z half=%.4f\n", axY.halfRange, axZ.halfRange);
-            printf(">> Permanent fit: set HALF_RANGE_MAX = %.4f\n", recommend);
-            Sleep(200);
+            if (GetAsyncKeyState(VK_F10) & 0x8000) {
+                g_debugMode = !g_debugMode;
+                printf("\nDebug %s\n", g_debugMode ? "ON" : "OFF");
+                Sleep(200);
+            }
+            if (GetAsyncKeyState(VK_F11) & 0x8000) {
+                printf("\nRecalibrating - move to ALL extremes for 4 seconds...\n");
+                axY = {}; axZ = {};
+                DWORD t1 = GetTickCount();
+                while (GetTickCount() - t1 < 4000) {
+                    double rx, ry, rz;
+                    if (dhdGetPosition(&rx, &ry, &rz) >= 0) { axY.UpdateReach(ry); axZ.UpdateReach(rz); }
+                    Sleep(1);
+                }
+                double rawHalfY = (axY.absMax - axY.absMin) * 0.5;
+                double rawHalfZ = (axZ.absMax - axZ.absMin) * 0.5;
+                double fitY = rawHalfY * CALIB_FILL, fitZ = rawHalfZ * CALIB_FILL;
+                if (fitY >= CALIB_MIN && fitY <= CALIB_MAX) axY.halfRange = fitY;  // guard against a partial sweep
+                if (fitZ >= CALIB_MIN && fitZ <= CALIB_MAX) axZ.halfRange = fitZ;
+                double recommend = (axY.halfRange < axZ.halfRange) ? axY.halfRange : axZ.halfRange;
+                printf("Measured half-extent:  Y=%.4f m  Z=%.4f m\n", rawHalfY, rawHalfZ);
+                printf("Work area now:  Y half=%.4f  Z half=%.4f\n", axY.halfRange, axZ.halfRange);
+                printf(">> Permanent fit: set HALF_RANGE_MAX = %.4f in %s\n", recommend, g_configPath);
+                QueryPerformanceCounter(&qLast);      // don't let the 4s calibration produce a giant dt
+                QueryPerformanceCounter(&qDeadline);
+                Sleep(200);
+            }
         }
-        Sleep(UPDATE_RATE_MS);
+
+        // ── Loop pacing ────────────────────────────────────────────────────
+        // UPDATE_RATE_MS == 0: no wait at all — the dhd USB transactions throttle
+        // the loop to ~1000Hz naturally (Sleep(0) still yields the timeslice, which
+        // is what was costing rate). UPDATE_RATE_MS >= 1: precise QPC-deadline
+        // pacing — coarse Sleep(1) while >1.5ms remain, then yield-spin the rest,
+        // instead of raw Sleep()'s 1-2ms lottery.
+        if (periodTicks > 0) {
+            qDeadline.QuadPart += periodTicks;
+            LARGE_INTEGER qChk; QueryPerformanceCounter(&qChk);
+            if (qDeadline.QuadPart < qChk.QuadPart) qDeadline = qChk;   // fell behind: don't spiral
+            for (;;) {
+                QueryPerformanceCounter(&qChk);
+                LONGLONG remain = qDeadline.QuadPart - qChk.QuadPart;
+                if (remain <= 0) break;
+                double remainMs = remain * 1000.0 / (double)qpf.QuadPart;
+                if (remainMs > 1.5) Sleep(1);
+                else Sleep(0);
+            }
+        }
     }
 
     dhdSetForce(0.0, 0.0, 0.0);
