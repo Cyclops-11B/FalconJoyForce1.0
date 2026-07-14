@@ -2,21 +2,19 @@
 // Novint Falcon -> Pico 2 W (CP2102 serial) -> Xbox 360 controller
 //
 // CHANGES THIS REVISION:
-//  - dt now measured with QueryPerformanceCounter (GetTickCount is 1ms-quantized;
-//    at ~1kHz every IIR filter was being fed a wrong dt every frame)
-//  - UPDATE_RATE_MS = 0 -> NO Sleep at all; the dhd USB transactions pace the loop
-//    to 1000 Hz naturally (per Force Dimension support). UPDATE_RATE_MS >= 1 ->
-//    precise QPC-deadline pacing (coarse Sleep then yield-spin) instead of raw Sleep().
-//  - Controller serial packets decimated to SERIAL_SEND_MS (default 2ms = 500Hz);
-//    button changes still send immediately. Haptic loop no longer stalls on WriteFile.
-//  - RUMBLE_DECAY converted from per-FRAME to per-MILLISECOND (dt-based) so feel is
-//    identical at any loop rate. Default changed 0.60 -> 0.70 to match old feel at ~700Hz.
 //  - FIXED: ApplyForces had local static FRICTION_VEL_MIN/MAX shadowing the globals;
 //    the global FRICTION_VEL_MIN=0.0006 was never in effect (0.003 was). Shadows
 //    removed; global default set to 0.003 so behavior is unchanged but now tunable.
 //  - Keyboard polling throttled to every 25ms; serial-thread RAW print gated on debug.
 //  - Config file: loads falcon_config.txt at startup (auto-writes a template with all
 //    defaults if missing). '#' and '//' comments. F8 = live reload while running.
+//  - Config template (and auto-appended new keys) now written ENTIRELY COMMENTED OUT:
+//    every line shows the compiled default; uncomment a line to override it. The loader
+//    recognizes keys inside commented lines so an all-commented file is not re-appended.
+//  - Typical output band: RECOIL_TYPICAL_MIN/MAX_N and AMBIENT_TYPICAL_MIN/MAX_N clamp
+//    the commanded recoil push / ambient magnitude into a user-set Newton band —
+//    above the band -> max, nonzero below the band -> min. TYPICAL_FLOOR_GATE keeps
+//    decaying tails / noise from being raised to the minimum. 0 disables an edge.
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
@@ -81,9 +79,9 @@ static double FLICK_DECAY = 0.92;   // per-ms decay of the carry tail — lower 
 static double FLICK_CARRY_MAX = 0.9;    // clamp on carry deflection so big flicks don't over-throw
 
 // Push zone variables
-static double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
-static double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
-static double PUSH_SPEED_BASE = 0.44; // how fast cursor moves when entering push zone
+static double PUSH_ENTER_RAD = 0.84; // percentage of work radius where push zone kicks in
+static double PUSH_EXIT_RAD = 0.84; // percentage of work radius where push zone stops acting
+static double PUSH_SPEED_BASE = 0.64; // how fast cursor moves when entering push zone
 static double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
 static double PUSH_VERTICAL_SCALE = 0.5; // up/down (Z axis) push-speed multiplier; left/right (Y axis) is unaffected
 static double HALF_RANGE_MAX = 0.06; // how large work radius is (in m) — config changes take effect on next F11 recalibrate
@@ -100,9 +98,7 @@ static double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = fast
 
 // ── Boundary detent: a ridge you push over right before the push zone ─────────
 static double DETENT_WIDTH = 0.12; // fraction of work radius over which the ridge builds
-static double DETENT_PEAK_N = 1.6;  // ridge height in N — resistance grows, then releases at threshold
-static double DETENT_VEL_HYST = 0.003; // m/s direction threshold — detent arms moving out, suppresses moving back in
-static double DETENT_VOUT_HZ = 10.0;   // low-pass on the radial-velocity ARMING signal only (not the force). Tangential slides along the wall make raw vOut tremor across ±HYST and buzz the latch; genuine reversals pass a 10Hz filter in ~15-20ms. Lower = steadier latch, slower reversal release
+static double DETENT_PEAK_N = 1.4;  // ridge height in N — resistance grows, then releases at threshold
 static double EDGE_HYST = 0.02;        // fraction of work radius of SPATIAL hysteresis on the pop latch at the push border. Once popped through, the ridge stays released (and the pump won't fire) until r retreats this far back inside — stops mm-wobble on the border from strobing the wall on/off
 
 // ── Exit pump: a brief inward kick right at the border when leaving the push zone ──
@@ -134,9 +130,19 @@ static double DITHER_VEL_FADE = 0.010; // m/s above which dither is fully faded 
 static double BTN2_X_FORCE = 1.6;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
 static double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
 
+// ── Braced aim mode ──────────────────────────────────────────────────────────
+// A grip button becomes a sensitivity brace instead of a controller button:
+// while braced, velocity-zone stick output and push-zone speed are scaled down
+// for precision aiming. The button is CONSUMED — masked out of the packet sent
+// to the Pico, so the game never sees it.
+static int    BRACE_BUTTON = 0;      // grip button 1-4 (4 = mask bit 8); 0 = disabled (button passes through normally)
+static bool   BRACE_TOGGLE = false;  // false = hold to brace (ADS-style); true = press toggles on/off
+static double BRACE_VEL_SCALE = 0.3; // velocity-zone stick output multiplier while braced
+static double BRACE_PUSH_SCALE = 0.3;// push-zone speed multiplier while braced
+
 //  Spring box ─────────────────────────────────────────────────────────────────────
-static double FORCE_SPRING_START = 0.5; // percentage of work radius where spring force starts
-static double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
+static double FORCE_SPRING_START = 0.78; // percentage of work radius where spring force starts
+static double FORCE_MAX_RAD = 0.95; // percentage of work radius where max force is achieved
 static double FORCE_MAX_N = 8; // maximum allowable Force (in N)
 static double FORCE_DAMPING = 1.0; // cut down on springiness
 static double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
@@ -159,8 +165,8 @@ static double AMBIENT_ATTACK_HZ = 7.0;          // ambient magnitude ramp-up cut
 static double AMBIENT_RELEASE_HZ = 3.0;         // ambient magnitude ramp-down cutoff (slower = softer fade)
 
 // ──Recoil settings ──────────────────────────────────────────────────────
-static double RUMBLE_LARGE_SCALE = 2.4;  // recoil force scale
-static double RUMBLE_SMALL_SCALE = 2.4;  // recoil force scale
+static double RUMBLE_LARGE_SCALE = 3.4;  // recoil force scale
+static double RUMBLE_SMALL_SCALE = 3.4;  // recoil force scale
 static DWORD  RECOIL_WINDOW_MS = 250; // ms after btn 1 release to still catch trigger recoil
 static double RECOIL_SUSTAIN_THRESHOLD = 0.5;  // liveMag above this = sustaining
 static double RECOIL_CURVE = 0.50; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
@@ -213,6 +219,51 @@ static double AGC_GAIN_MAX = 3.0;  // gain clamp — a quiet game's noise floor 
 static double AGC_DYNAMICS = 1.0;  // 1 = ratios preserved exactly; >1 expands kick/tail separation; <1 compresses
 static double AGC_TOLERANCE = 1.5; // dead band ratio: averages within TARGET/x .. TARGET*x are left RAW (gain 1). Outside, correction pulls the level to the band EDGE (not the center) so it engages smoothly with no jump at the threshold. 1.0 = always correct (old behavior)
 static volatile double g_agcAvg = 0.0;  // learned average (0 = unseeded; first qualifying packet seeds it)
+
+// ── Typical output band: intuitive Newton-space clamp on recoil / ambient ────
+// Instead of reasoning about scale factors, set the band of forces you actually
+// want to feel. Commanded output above the band is normalized DOWN to the max;
+// nonzero output below the band is normalized UP to the min; inside passes raw.
+// Recoil band applies to the recoil X push target (before release shaping);
+// ambient band applies to the ambient magnitude target (before attack/release
+// smoothing) — so both envelopes stay clean. 0 disables that edge (default =
+// behavior identical to before). TYPICAL_FLOOR_GATE: inputs below this are
+// treated as silence and NOT raised to the min — without it the exponentially
+// decaying rumble tail (which never quite reaches zero) would pin output at min.
+static double RECOIL_TYPICAL_MIN_N = 2.5;  // recoil push floor (N); 0 = no floor
+static double RECOIL_TYPICAL_MAX_N = 0.0;  // recoil push ceiling (N); 0 = no ceiling (FORCE_MAX_N still caps)
+static double AMBIENT_TYPICAL_MIN_N = 3.0; // ambient magnitude floor (N); 0 = no floor
+static double AMBIENT_TYPICAL_MAX_N = 9.0; // ambient magnitude ceiling (N); 0 = no ceiling (FORCE_YZ_CAP_N still caps)
+static double TYPICAL_FLOOR_GATE = 0.05;   // commanded force (N) below this counts as silence for the floor
+
+static inline double ApplyTypicalBand(double f, double bandMin, double bandMax) {
+    if (f <= TYPICAL_FLOOR_GATE) return f;              // silence / dying tail: pass raw so it can reach 0
+    if (bandMax > 0.0 && f > bandMax) f = bandMax;      // above the band -> normalized to max
+    if (bandMin > 0.0 && f < bandMin) f = bandMin;      // below the band -> normalized to min
+    return f;
+}
+
+// ── Idle recentering ─────────────────────────────────────────────────────────
+// Recoil compensation drags the handle toward the bottom of the work circle.
+// During genuine idle (no recoil/rumble/push/brace, velocity quiet for
+// RECENTER_DELAY_MS) an INTEGRATING FORCE SERVO pulls toward center: force
+// builds from zero at RECENTER_GAIN_NPS until the handle actually breaks
+// stiction and starts drifting, then self-regulates to hold RECENTER_DRIFT_MPS
+// (builds when slower, backs off when faster) — so it always finds exactly the
+// force this mechanism needs, no more. It stops integrating just outside the
+// center deadband, releases entirely inside it, and cuts almost instantly
+// (RECENTER_CUT_HZ, integrator reset) the moment any activity resumes. While
+// the servo is actively drifting the handle, user-motion detection switches to
+// the higher RECENTER_VEL_BREAK threshold so the servo's own slow drift doesn't
+// read as activity and stall it.
+static double RECENTER_MAX_N     = 1.2;    // servo force cap (N); 0 = feature off
+static double RECENTER_GAIN_NPS  = 0.15;   // build rate (N/s) at standstill -- how fast force grows until motion starts
+static double RECENTER_DRIFT_MPS = 0.002;  // target inward drift speed (m/s) the servo regulates to once moving
+static double RECENTER_DEADZONE  = 0.15;   // fraction of work radius: inside = released (force 0, integrator reset)
+static DWORD  RECENTER_DELAY_MS  = 1200;   // continuous quiet time required before engaging
+static double RECENTER_VEL_QUIET = 0.003;  // m/s -- motion above this counts as activity while DISENGAGED
+static double RECENTER_VEL_BREAK = 0.010;  // m/s -- motion above this counts as activity while ENGAGED (user grabbing it)
+static double RECENTER_CUT_HZ    = 10.0;   // disengage cutoff -- force is gone within ~100ms of any activity
 
 
 // ── Config file ──────────────────────────────────────────────────────────────
@@ -293,9 +344,7 @@ static CfgEntry g_cfgTable[] = {
 
     SEC("Boundary detent & exit pump"),
     C_D(DETENT_WIDTH,       "fraction of work radius over which the ridge builds"),
-    C_D(DETENT_PEAK_N,      "ridge height (N) -- resistance grows, then releases at the push threshold"),
-    C_D(DETENT_VEL_HYST,    "m/s radial-direction threshold -- arms moving out, suppresses moving back in"),
-    C_D(DETENT_VOUT_HZ,     "low-pass on the ARMING signal only (not the force); lower = steadier latch, lazier reversal release"),
+    C_D(DETENT_PEAK_N,      "ridge height (N) -- this IS the wall at the border (spring is ~0.1N there); raise for a firmer stop"),
     C_D(EDGE_HYST,          "spatial hysteresis (fraction of work radius) on the border pop latch; stops edge wobble strobing the ridge/pump"),
     C_D(PUMP_PEAK_N,        "inward kick strength (N) crossing back out of push"),
     C_D(PUMP_DECAY,         "PER-MS decay of the kick -- lower = snappier/shorter pump"),
@@ -316,6 +365,12 @@ static CfgEntry g_cfgTable[] = {
     SEC("Button 2 brace / preload"),
     C_D(BTN2_X_FORCE,       "constant X force while button 2 held (N) -- preloads mechanism for fine corrections"),
     C_D(BTN2_X_SIGN,        "+1 or -1 to flip preload direction"),
+
+    SEC("Braced aim mode"),
+    C_I(BRACE_BUTTON,       "grip button 1-4 that enters braced aim (4 = mask bit 8); 0 = disabled. Button is consumed, not sent to the game"),
+    C_B(BRACE_TOGGLE,       "false = hold to brace (ADS-style); true = press toggles on/off"),
+    C_D(BRACE_VEL_SCALE,    "velocity-zone stick output multiplier while braced"),
+    C_D(BRACE_PUSH_SCALE,   "push-zone speed multiplier while braced"),
 
     SEC("Spring wall"),
     C_D(FORCE_SPRING_START, "fraction of work radius where spring force starts"),
@@ -384,6 +439,23 @@ static CfgEntry g_cfgTable[] = {
     C_D(AGC_GAIN_MAX,         "gain clamp -- quiet games amplified at most this far (keeps noise floor from becoming phantom recoil)"),
     C_D(AGC_DYNAMICS,         "1 = ratios preserved exactly; >1 expands kick/tail separation; <1 compresses"),
     C_D(AGC_TOLERANCE,        "dead band: averages within TARGET/x..TARGET*x stay raw; outside, level pulled to the band edge. 1.0 = always correct"),
+
+    SEC("Typical output band (Newton-space clamp)"),
+    C_D(RECOIL_TYPICAL_MIN_N,  "recoil push floor (N) -- nonzero recoil below the band is raised to this; 0 = no floor"),
+    C_D(RECOIL_TYPICAL_MAX_N,  "recoil push ceiling (N) -- recoil above the band is lowered to this; 0 = no ceiling"),
+    C_D(AMBIENT_TYPICAL_MIN_N, "ambient magnitude floor (N); 0 = no floor"),
+    C_D(AMBIENT_TYPICAL_MAX_N, "ambient magnitude ceiling (N); 0 = no ceiling"),
+    C_D(TYPICAL_FLOOR_GATE,    "forces below this (N) count as silence and are NOT raised to the floor (lets tails decay to 0)"),
+
+    SEC("Idle recentering"),
+    C_D(RECENTER_MAX_N,     "servo force cap (N) pulling toward center during idle; 0 = off"),
+    C_D(RECENTER_GAIN_NPS,  "force build rate (N/s) at standstill -- grows until the handle breaks free and drifts"),
+    C_D(RECENTER_DRIFT_MPS, "target inward drift speed (m/s) the servo holds once moving"),
+    C_D(RECENTER_DEADZONE,  "fraction of work radius: inside = released, force 0"),
+    C_U(RECENTER_DELAY_MS,  "continuous quiet time (ms) before the servo engages"),
+    C_D(RECENTER_VEL_QUIET, "m/s -- motion above this counts as activity while disengaged"),
+    C_D(RECENTER_VEL_BREAK, "m/s -- motion above this counts as activity while engaged (so the servo's own drift doesn't stall it)"),
+    C_D(RECENTER_CUT_HZ,    "disengage cutoff (Hz) -- how fast the pull vanishes when activity resumes"),
 };
 static const int g_cfgCount = (int)(sizeof(g_cfgTable) / sizeof(g_cfgTable[0]));
 
@@ -395,7 +467,10 @@ static void CfgTrim(char* s) {
     while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = 0;
 }
 
-static void CfgWriteEntry(FILE* f, const CfgEntry& e) {
+// commentedOut=true writes the line disabled ("# NAME = value ...") so the value
+// documents the compiled default without overriding it; the user uncomments a
+// line to take manual control of that setting.
+static void CfgWriteEntry(FILE* f, const CfgEntry& e, bool commentedOut) {
     if (e.type == CFG_SECTION) {
         fprintf(f, "\n# ---------- %s ----------\n", e.name);
         return;
@@ -409,21 +484,25 @@ static void CfgWriteEntry(FILE* f, const CfgEntry& e) {
     case CFG_STR:   snprintf(val, sizeof(val), "%s", (char*)e.ptr); break;
     default:        val[0] = 0; break;
     }
+    const char* pre = commentedOut ? "# " : "";
     if (e.comment && *e.comment)
-        fprintf(f, "%-26s = %-10s # %s\n", e.name, val, e.comment);
+        fprintf(f, "%s%-26s = %-10s # %s\n", pre, e.name, val, e.comment);
     else
-        fprintf(f, "%-26s = %s\n", e.name, val);
+        fprintf(f, "%s%-26s = %s\n", pre, e.name, val);
 }
 
 static void WriteConfigTemplate(const char* path) {
     FILE* f = fopen(path, "w");
     if (!f) { printf("Config: could not write template %s\n", path); return; }
     fprintf(f, "# FalconJoyForce configuration\n");
+    fprintf(f, "# EVERY setting below is COMMENTED OUT and shows its compiled default.\n");
+    fprintf(f, "# Uncomment a line (remove the leading '#') to take manual control of that value.\n");
+    fprintf(f, "# Commented lines keep their compiled defaults, so an untouched file changes nothing.\n");
     fprintf(f, "# Edit values and restart, or press F8 in the running program to reload live.\n");
     fprintf(f, "# Anything after '#' or '//' is a comment. Missing keys keep their compiled defaults.\n");
-    for (int i = 0; i < g_cfgCount; i++) CfgWriteEntry(f, g_cfgTable[i]);
+    for (int i = 0; i < g_cfgCount; i++) CfgWriteEntry(f, g_cfgTable[i], true);
     fclose(f);
-    printf("Config: wrote template with defaults -> %s\n", path);
+    printf("Config: wrote template (all values commented out = compiled defaults) -> %s\n", path);
 }
 
 static bool LoadConfig(const char* path) {
@@ -437,6 +516,35 @@ static bool LoadConfig(const char* path) {
     int applied = 0;
     bool present[sizeof(g_cfgTable) / sizeof(g_cfgTable[0])] = {};
     while (fgets(line, sizeof(line), f)) {
+        // Commented-out entries ("# NAME = value") are the template's disabled
+        // defaults. They must NOT be applied, but they DO count as "present" —
+        // otherwise the self-healing append would re-add the whole table on
+        // every run of an all-commented template.
+        {
+            char* p = line;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p == '#' || (p[0] == '/' && p[1] == '/')) {
+                char probe[512];
+                strncpy(probe, p, sizeof(probe) - 1);
+                probe[sizeof(probe) - 1] = 0;
+                char* q = probe;
+                while (*q == '#' || *q == '/' || isspace((unsigned char)*q)) q++;   // strip leading markers
+                char* pc = strchr(q, '#');   if (pc) *pc = 0;                        // strip trailing comment
+                pc = strstr(q, "//");        if (pc) *pc = 0;
+                char* peq = strchr(q, '=');
+                if (peq) {
+                    *peq = 0;
+                    CfgTrim(q);
+                    if (*q) {
+                        for (int i = 0; i < g_cfgCount; i++) {
+                            if (g_cfgTable[i].type == CFG_SECTION) continue;
+                            if (_stricmp(g_cfgTable[i].name, q) == 0) { present[i] = true; break; }
+                        }
+                    }
+                }
+                continue;   // never parse a commented line as an active setting
+            }
+        }
         char* c = strchr(line, '#');   if (c) *c = 0;   // strip comments
         c = strstr(line, "//");        if (c) *c = 0;
         char* eq = strchr(line, '=');  if (!eq) continue;
@@ -473,13 +581,29 @@ static bool LoadConfig(const char* path) {
     for (int i = 0; i < g_cfgCount; i++)
         if (g_cfgTable[i].type != CFG_SECTION && !present[i]) missing++;
     if (missing > 0) {
-        printf("Config: %d key(s) not in file (compiled defaults in effect):\n  ", missing);
+        // Self-healing config: new tunables added since this file was created are
+        // appended (with their comments and current defaults) under a marker, so
+        // the file stays complete across code updates without touching tuned values.
+        FILE* fa = fopen(path, "a");
+        if (fa) {
+            fprintf(fa, "\n# ---------- Added by program: new keys since this file was created ----------\n");
+            fprintf(fa, "# (commented out = compiled defaults; uncomment to override)\n");
+            for (int i = 0; i < g_cfgCount; i++) {
+                if (g_cfgTable[i].type == CFG_SECTION || present[i]) continue;
+                CfgWriteEntry(fa, g_cfgTable[i], true);
+            }
+            fclose(fa);
+            printf("Config: appended %d new key(s) (commented out) to %s:\n  ", missing, path);
+        }
+        else {
+            printf("Config: %d key(s) missing and file not writable (defaults in effect):\n  ", missing);
+        }
         int shown = 0;
         for (int i = 0; i < g_cfgCount; i++) {
             if (g_cfgTable[i].type == CFG_SECTION || present[i]) continue;
             printf("%s%s", shown++ ? ", " : "", g_cfgTable[i].name);
         }
-        printf("\n  (rename the file and rerun to generate a complete template, then merge your tuned values)\n");
+        printf("\n");
     }
     return true;
 }
@@ -490,6 +614,17 @@ static void ApplyDerivedConfig() {
     if (VEL_WINDOW_SAMPLES < 2) VEL_WINDOW_SAMPLES = 2;   // history arrays are sized 8 —
     if (VEL_WINDOW_SAMPLES > 8) VEL_WINDOW_SAMPLES = 8;   // clamp so indexing can never overrun
     if (VEL_ZERO_FRAMES < 1) VEL_ZERO_FRAMES = 1;
+    // Typical band sanity: if both edges are set, min may not exceed max
+    if (RECOIL_TYPICAL_MAX_N > 0.0 && RECOIL_TYPICAL_MIN_N > RECOIL_TYPICAL_MAX_N)
+        RECOIL_TYPICAL_MIN_N = RECOIL_TYPICAL_MAX_N;
+    if (AMBIENT_TYPICAL_MAX_N > 0.0 && AMBIENT_TYPICAL_MIN_N > AMBIENT_TYPICAL_MAX_N)
+        AMBIENT_TYPICAL_MIN_N = AMBIENT_TYPICAL_MAX_N;
+    if (TYPICAL_FLOOR_GATE < 0.0) TYPICAL_FLOOR_GATE = 0.0;
+    // Recenter servo sanity
+    if (RECENTER_DEADZONE < 0.0) RECENTER_DEADZONE = 0.0;
+    if (RECENTER_DRIFT_MPS < 0.0005) RECENTER_DRIFT_MPS = 0.0005;   // must sit above the velocity-estimation floor or the servo can't see its own drift
+    if (RECENTER_VEL_BREAK < RECENTER_VEL_QUIET) RECENTER_VEL_BREAK = RECENTER_VEL_QUIET;
+    if (RECENTER_MAX_N > FORCE_YZ_CAP_N) RECENTER_MAX_N = FORCE_YZ_CAP_N;
 }
 
 
@@ -527,6 +662,13 @@ static bool RecoilDequeue(double& peak) {
 static volatile float g_rumbleLarge = 0.0f;
 static volatile float g_rumbleSmall = 0.0f;
 static double g_recoilForce = 0.0;
+// Live commanded-output readout (Newtons) for tuning the typical band. These are
+// PER-SECOND PEAK HOLDs — updated every loop, displayed and reset on the 1Hz
+// status tick — because a recoil kick lasts far less than the display interval,
+// so a plain snapshot would almost always read 0 between shots.
+static double g_dbgRecoilRawN = 0.0;   // recoil X push before the typical band (peak)
+static double g_dbgRecoilOutN = 0.0;   // recoil X push actually commanded (peak, post band + shaping + preload)
+static double g_dbgAmbientN   = 0.0;   // ambient/rumble Y/Z magnitude actually commanded (peak)
 static DWORD  g_btn1Released = 0;
 static double g_pushDamp = 0.0;
 static volatile float g_rumbleLargePeak = 0.0f;  // undecayed, for sustain check
@@ -912,36 +1054,17 @@ static void ApplyForces(double y, double z,
         forceZ = -dirZ * mag;
     }
 
-    // ── Boundary detent — felt approaching the push zone ─────────────────────────
-    // Direction-latched: full-strength on the way OUT (crisp pop at the threshold,
-    // unchanged from the plain position detent), but it releases the instant you turn
-    // back — so coming in it kicks out right at the border instead of lingering inward.
-    // This is a direction switch, not a speed-proportional gate, so outward feel and
-    // slow-approach crispness are untouched. Re-arms on every outward move, so repeated
-    // border crossings stay crisp.
-    // Low-passed radial velocity — the detent latch's DECISION signal only.
-    // Raw vOut hovers around zero on a tangential slide along the wall; hand tremor
-    // crossing ±DETENT_VEL_HYST was flapping the armed latch and toggling the ridge
-    // force on/off at loop rate = buzz (unmasked by the true-dt timing fix — the old
-    // quantized dt froze the velocity filter on many frames and hid it). Updated every
-    // frame (not just inside the band) so it's never stale on band entry. The ridge
-    // FORCE is never filtered — outward pop stays crisp.
-    static double vOutSm = 0.0;
-    {
-        double vOutRaw = (r > 0.0001) ? (velY * (offY / r) + velZ * (offZ / r)) : 0.0;
-        double aVo = 1.0 - exp(-2.0 * 3.14159265 * DETENT_VOUT_HZ * dt);
-        vOutSm += aVo * (vOutRaw - vOutSm);
-    }
-
-    // ── Border pop latch (shared by ridge and pump) ──────────────────────────────
-    // The ridge cuts to zero exactly at PUSH_ENTER_RAD (the intended pop for a
-    // deliberate crossing) — but that is a position CLIFF with no width. Riding
-    // along the border, mm-level radial wobble strafes across it, square-waving the
-    // whole 1.6N wall on/off (the rumble) and opening force-free windows to slip
-    // through (the spring is only ~0.1N this shallow). The latch adds spatial
-    // hysteresis: crossing the border pops as before, but the popped state holds —
-    // ridge released, pump armed — until r retreats EDGE_HYST back inside. Riding
-    // the edge now sits cleanly in one state instead of strobing between them.
+    // ── Boundary detent — the wall at the velocity-zone edge ─────────────────────
+    // PURE POSITION FUNCTION. Earlier versions gated the ridge on radial-velocity
+    // direction (arm moving out, suppress moving in); a tangential slide along the
+    // wall has no stable radial sign, so any velocity-direction gate MUST strobe the
+    // full ridge force on/off there — that was the rumble, and no amount of signal
+    // filtering fixes a binary gate keyed to a signal that wanders across zero.
+    // The case the gate existed for (post-pop re-entry dragging inward across the
+    // band) is handled by the edgePopped spatial latch below, so the gate is gone.
+    // A position-only force cannot rumble under tangential motion: sliding the wall
+    // is now a constant, full-strength ridge. Inward passes that never popped get a
+    // gentle inward assist toward center (detent-valley behavior).
     static bool edgePopped = false;
     static bool edgePoppedPrev = false;
     if (r >= PUSH_ENTER_RAD) edgePopped = true;
@@ -950,16 +1073,11 @@ static void ApplyForces(double y, double z,
     double detentStart = PUSH_ENTER_RAD - DETENT_WIDTH;        // ridge begins here
     if (!edgePopped && r > detentStart && r < PUSH_ENTER_RAD && r > 0.0001) {
         double dirY = offY / r, dirZ = offZ / r;
-        static int detentArmed = 1;                            // holds last clear direction (hysteresis)
-        if (vOutSm > DETENT_VEL_HYST) detentArmed = 1;         // moving out → arm
-        else if (vOutSm < -DETENT_VEL_HYST) detentArmed = 0;   // moving back in → suppress (kicks out at border)
-        if (detentArmed) {
-            double u = (r - detentStart) / DETENT_WIDTH;       // 0 at ridge start, 1 at push threshold
-            u = u * u * (3.0 - 2.0 * u);                       // smoothstep — gentle build
-            double lip = u * DETENT_PEAK_N;
-            forceY += -dirY * lip;                             // resist outward; drops to 0 at threshold = the "pop"
-            forceZ += -dirZ * lip;
-        }
+        double u = (r - detentStart) / DETENT_WIDTH;           // 0 at ridge start, 1 at push threshold
+        u = u * u * (3.0 - 2.0 * u);                           // smoothstep — gentle build
+        double lip = u * DETENT_PEAK_N;
+        forceY += -dirY * lip;                                 // resist outward; releases past threshold = the "pop"
+        forceZ += -dirZ * lip;
     }
 
     // ── Exit pump — a brief inward kick when leaving the push border ──────────────
@@ -1045,11 +1163,84 @@ static void ApplyForces(double y, double z,
     dhdSetForce(rumX, forceY, forceZ);
 }
 
+// ── Console status region ────────────────────────────────────────────────────
+// After startup, the primary Hz/status readout is pinned to ONE line that
+// updates in place. Contextual info (debug detail, AGC, one-shot event notices)
+// renders on the lines BELOW it and is cleared automatically once no longer
+// relevant, so the terminal doesn't scroll during normal operation. Absolute
+// cursor positioning (Win32 console API) is used instead of '\r' so the block
+// below the status line can grow and shrink cleanly.
+static HANDLE g_hCon        = INVALID_HANDLE_VALUE;
+static SHORT  g_conAnchorY  = -1;    // buffer row the status line is pinned to (-1 = no console → plain printf fallback)
+static int    g_conPrevLines = 0;    // lines drawn last frame, so a shrinking block clears its leftovers
+static int    g_conWidth    = 120;
+static char   g_statusLine[256] = "";  // cached pinned status line (row 0)
+static char   g_belowCache[6][256];    // cached contextual lines (debug detail, AGC…)
+static int    g_belowCount  = 0;       // how many of g_belowCache are live
+static char   g_notice[160] = "";      // latest event message; persists until a newer one replaces it
+
+// (Re)capture the anchor at the CURRENT cursor row. Called once after startup,
+// and again after any modal action (F11 recalibrate) that prints below.
+static void ConsoleAnchorHere() {
+    g_hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (g_hCon != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(g_hCon, &csbi)) {
+        g_conAnchorY = csbi.dwCursorPosition.Y;
+        g_conWidth = csbi.dwSize.X;
+        if (g_conWidth < 40)  g_conWidth = 40;
+        if (g_conWidth > 240) g_conWidth = 240;
+    } else {
+        g_conAnchorY = -1;   // redirected / no console: fall back to plain prints
+    }
+    g_conPrevLines = 0;
+}
+
+// Write one line at (0,row), space-padded to the console width so any longer
+// text left from a previous frame on that row is erased. Truncated to width-1.
+static void ConWriteLine(SHORT row, const char* text) {
+    COORD at = { 0, row };
+    SetConsoleCursorPosition(g_hCon, at);
+    char buf[256];
+    int w = g_conWidth - 1;
+    if (w > (int)sizeof(buf) - 1) w = (int)sizeof(buf) - 1;
+    int n = 0;
+    while (text[n] && n < w) { buf[n] = text[n]; n++; }
+    while (n < w) buf[n++] = ' ';
+    DWORD wr; WriteConsoleA(g_hCon, buf, n, &wr, NULL);
+}
+
+// Repaint the whole region from the cache: status line, contextual lines, then
+// the persistent notice as the last line. Called on the 1Hz status refresh AND
+// immediately whenever a notice is posted, so events show up without waiting.
+static void ConsoleRepaint() {
+    if (g_conAnchorY < 0) return;   // no-console: nothing to pin (notices printf'd instead)
+    SHORT row = g_conAnchorY;
+    ConWriteLine(row++, g_statusLine);
+    for (int i = 0; i < g_belowCount; i++) ConWriteLine(row++, g_belowCache[i]);
+    if (g_notice[0]) ConWriteLine(row++, g_notice);
+    int drawn = 1 + g_belowCount + (g_notice[0] ? 1 : 0);
+    for (int i = drawn; i < g_conPrevLines; i++) ConWriteLine(row++, "");   // erase a taller previous frame
+    g_conPrevLines = drawn;
+    COORD park = { 0, row };
+    SetConsoleCursorPosition(g_hCon, park);   // park below the block so stray prints land cleanly
+}
+
+// Post an event message. It appears immediately below the status line and stays
+// there until a newer notice replaces it (no timeout).
+static void ConsoleNotice(const char* msg) {
+    strncpy(g_notice, msg, sizeof(g_notice) - 1);
+    g_notice[sizeof(g_notice) - 1] = 0;
+    if (g_conAnchorY < 0) { printf("%s\n", msg); return; }   // no-console fallback
+    ConsoleRepaint();
+}
+
+
 // ── Main ───────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     InitializeCriticalSection(&g_recoilCS);
 
-    printf("FalconJoyForce - Falcon -> Pico 2W (Serial) -> Xbox Controller\n\n");
+    printf("FalconJoyForce - Falcon -> Pico 2W (Serial) -> Xbox Controller\n");
+    printf("Build: %s %s\n\n", __DATE__, __TIME__);
 
     // Optional per-title profile: first argument overrides the config path
     if (argc > 1) {
@@ -1060,6 +1251,12 @@ int main(int argc, char* argv[]) {
     // Load config BEFORE anything uses the tunables (serial port, gravity, etc.)
     LoadConfig(g_configPath);
     ApplyDerivedConfig();
+
+    if (BRACE_BUTTON >= 1 && BRACE_BUTTON <= 4)
+        printf("Brace: button %d (consumed from controller output), %s mode, vel x%.2f, push x%.2f\n",
+            BRACE_BUTTON, BRACE_TOGGLE ? "toggle" : "hold", BRACE_VEL_SCALE, BRACE_PUSH_SCALE);
+    else
+        printf("Brace: disabled\n");
 
     printf("Opening %s at %lu baud...\n", SERIAL_PORT, (unsigned long)SERIAL_BAUD);
     if (!SerialOpen(SERIAL_PORT, SERIAL_BAUD)) {
@@ -1114,6 +1311,8 @@ int main(int argc, char* argv[]) {
 
     bool   recoilActive = false;
     bool   wasRecoilActive = false;
+
+    ConsoleAnchorHere();   // pin the status line to the current row; everything below scrolls under it
 
     while (true) {
         LARGE_INTEGER qNow; QueryPerformanceCounter(&qNow);
@@ -1239,6 +1438,40 @@ int main(int argc, char* argv[]) {
         rumblePhase += dt * 80.0 * 2.0 * 3.14159265;
         float rL = g_rumbleLarge, rS = g_rumbleSmall;
 
+        // ── Braced aim mode ────────────────────────────────────────────────
+        // Scales down aim output for precision. Applied after both zones so it
+        // covers velocity output, flick carry, position blend, and push speed.
+        static bool braceToggled = false;
+        static bool braceBtnWas = false;
+        bool braced = false;
+        if (BRACE_BUTTON >= 1 && BRACE_BUTTON <= 4) {
+            bool braceBtnHeld = (dhdGetButton(BRACE_BUTTON - 1) > 0);
+            if (BRACE_TOGGLE) {
+                if (braceBtnHeld && !braceBtnWas) braceToggled = !braceToggled;
+                braced = braceToggled;
+            }
+            else {
+                braced = braceBtnHeld;
+            }
+            braceBtnWas = braceBtnHeld;
+        }
+        else {
+            braceToggled = false;   // disabling the feature clears a latched toggle
+        }
+        if (braced) {
+            double s = inPush ? BRACE_PUSH_SCALE : BRACE_VEL_SCALE;
+            stickX *= s;
+            stickY *= s;
+        }
+        static bool braceWasActive = false;
+        if (braced != braceWasActive) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Braced aim %s  (vel x%.2f, push x%.2f)",
+                braced ? "ON" : "OFF", BRACE_VEL_SCALE, BRACE_PUSH_SCALE);
+            ConsoleNotice(msg);
+            braceWasActive = braced;
+        }
+
         // ── Button 1 recoil logic ──────────────────────────────────
         bool btn1held = (dhdGetButton(0) > 0);
         if (btn1WasHeld && !btn1held) g_btn1Released = now;
@@ -1359,6 +1592,11 @@ int main(int argc, char* argv[]) {
         // sawtooth is the buzz. Snap UP instantly so the kick and sustained hold stay
         // sharp, but low-pass on the way DOWN so the release tracks the rumble's decay
         // envelope as one clean ramp. RECOIL_RELEASE_HZ sets sharper (higher) vs smoother.
+        //
+        // Typical band applied HERE — on the commanded target, before the release
+        // low-pass — so a floored/ceilinged kick still gets a clean smoothed release.
+        if (fabs(rumX) > fabs(g_dbgRecoilRawN)) g_dbgRecoilRawN = rumX;    // pre-band peak (for the readout)
+        rumX = ApplyTypicalBand(rumX, RECOIL_TYPICAL_MIN_N, RECOIL_TYPICAL_MAX_N);
         static double g_recoilXOut = 0.0;
         if (rumX >= g_recoilXOut) {
             g_recoilXOut = rumX;                                   // rising → keep the sharp kick / hold
@@ -1391,6 +1629,12 @@ int main(int argc, char* argv[]) {
             // AMBIENT_DIR_SLEW_HZ, AMBIENT_ATTACK_HZ, AMBIENT_RELEASE_HZ
 
             double magTarget = (rL * AMBIENT_LARGE_SCALE + rS * AMBIENT_SMALL_SCALE);
+
+            // Typical band applied to the TARGET (before the attack/release smoother
+            // below), so the felt ambient lives in the user's Newton band while the
+            // envelope stays smooth. Applied before the tail-quiet zeroing so a
+            // silenced tail is never raised back up to the floor.
+            magTarget = ApplyTypicalBand(magTarget, AMBIENT_TYPICAL_MIN_N, AMBIENT_TYPICAL_MAX_N);
 
             // Hold ambient off for the whole recoil tail session — the smoother below then
             // keeps ambient faded out instead of buzzing on the tail. Genuine ambient with
@@ -1467,6 +1711,69 @@ int main(int argc, char* argv[]) {
         // ── Button 2: constant X preload to ease small corrections ───────────────────
         if (dhdGetButton(1) > 0) rumX += BTN2_X_SIGN * BTN2_X_FORCE;
 
+        double outX = rumX;                                      // final recoil X push (post band/shaping/preload)
+        double outYZ = sqrt(rumY * rumY + rumZ * rumZ);          // ambient + lateral-texture magnitude
+        if (fabs(outX)  > fabs(g_dbgRecoilOutN)) g_dbgRecoilOutN = outX;   // per-second peak holds
+        if (outYZ       > g_dbgAmbientN)         g_dbgAmbientN   = outYZ;
+
+        // ── Idle recentering (integrating force servo) ────────────────────────────
+        // Injected AFTER the force readout capture so it doesn't pollute the ambient
+        // peak. See the config block for the full rationale.
+        if (RECENTER_MAX_N > 0.0) {
+            static double recenterEnv = 0.0;          // 0..1 engage envelope (fast cut on activity)
+            static double recenterI = 0.0;            // integrated servo force (N)
+            static DWORD  recenterQuietStart = 0;     // start of the current quiet stretch
+
+            double velMag = sqrt(axY.smoothVel * axY.smoothVel + axZ.smoothVel * axZ.smoothVel);
+            bool rumbleFreshRC = (now - g_lastRumbleTime) < RUMBLE_FRESH_MS;
+            // While the servo is drifting the handle, its own slow motion must not
+            // read as "user activity" — switch to the higher BREAK threshold.
+            bool servoLive = (recenterEnv > 0.5 && recenterI > 0.0);
+            double velGate = servoLive ? RECENTER_VEL_BREAK : RECENTER_VEL_QUIET;
+            bool activity = recoilActive || g_recoilFiring || g_recoilTailActive
+                         || rumbleFreshRC || inPush || braced
+                         || velMag > velGate;
+            if (activity) recenterQuietStart = now;
+
+            bool engaged = !activity && (now - recenterQuietStart >= RECENTER_DELAY_MS);
+
+            // Envelope: instant-on permission when engaged (the servo itself starts
+            // from zero force, so onset is inherently gradual); fast fade on activity.
+            if (engaged) {
+                recenterEnv = 1.0;
+            } else {
+                double aCut = 1.0 - exp(-2.0 * 3.14159265 * RECENTER_CUT_HZ * dt);
+                recenterEnv += aCut * (0.0 - recenterEnv);
+                if (recenterEnv < 0.001) { recenterEnv = 0.0; recenterI = 0.0; }   // full reset: next engage rebuilds from zero
+            }
+
+            double rNorm = sqrt(offY * offY + offZ * offZ);   // normalized radial offset
+            if (recenterEnv > 0.0 && rNorm > 1e-6) {
+                if (rNorm <= RECENTER_DEADZONE) {
+                    recenterI = 0.0;   // reached center: release and stay released until re-engagement further out
+                } else if (engaged) {
+                    // Inward radial speed: project velocity onto the outward unit vector, negate.
+                    double vRad = (offY / rNorm) * axY.smoothVel + (offZ / rNorm) * axZ.smoothVel;   // + = outward
+                    double inwardSpd = -vRad;
+                    // Integrate on drift-speed error: standstill -> builds at GAIN_NPS
+                    // until stiction breaks; at target speed -> holds; too fast -> backs
+                    // off at the same rate. Error normalized by the target so GAIN_NPS
+                    // is the honest build rate in N/s regardless of the target chosen.
+                    double err = (RECENTER_DRIFT_MPS - inwardSpd) / RECENTER_DRIFT_MPS;
+                    if (err > 1.0) err = 1.0;      // can't build faster than GAIN_NPS…
+                    if (err < -2.0) err = -2.0;    // …but may unwind up to 2x as fast if overspeeding
+                    recenterI += RECENTER_GAIN_NPS * err * dt;
+                    if (recenterI < 0.0) recenterI = 0.0;
+                    if (recenterI > RECENTER_MAX_N) recenterI = RECENTER_MAX_N;
+                }
+                double mag = recenterI * recenterEnv;
+                if (mag > 0.0) {
+                    rumY += (-offY / rNorm) * mag;   // unit vector toward center
+                    rumZ += (-offZ / rNorm) * mag;
+                }
+            }
+        }
+
         ApplyForces(y, z, axY, axZ, axY.smoothVel, axZ.smoothVel, rumX, rumY, rumZ, dt);
 
 
@@ -1474,6 +1781,8 @@ int main(int argc, char* argv[]) {
         uint8_t btnMask = 0;
         for (int i = 0; i < 4; i++)
             if (dhdGetButton(i) > 0) btnMask |= (1u << i);
+        if (BRACE_BUTTON >= 1 && BRACE_BUTTON <= 4)
+            btnMask &= (uint8_t)~(1u << (BRACE_BUTTON - 1));   // brace button is consumed, never sent
 
         // ── Send controller packet (decimated) ─────────────────────────────
         // The haptic loop runs ~1kHz but the Pico/Xbox side samples far slower;
@@ -1500,14 +1809,36 @@ int main(int argc, char* argv[]) {
         if (now - lastStats >= 1000) {
             int qcount = (g_recoilQHead - g_recoilQTail + RECOIL_QUEUE_SIZE) % RECOIL_QUEUE_SIZE;
             double r = sqrt(offY * offY + offZ * offZ);
+
+            // ── Pinned status line (row 0 of the region) ──
+            int col = (int)((offY + 1.0) / 2.0 * 8.0 + 0.5);
+            col = col < 0 ? 0 : (col > 8 ? 8 : col);
+            char bar[16]; for (int c = 0; c <= 8; c++) bar[c] = (c == col) ? 'O' : '.'; bar[9] = 0;
+            snprintf(g_statusLine, sizeof(g_statusLine),
+                "%4d Hz %s r=%.2f %s  damp=%.2f  [%s]  stk=(%.2f,%.2f)  vel=%.3f/%.3f  rbl=%.2f/%.2f  rcl=%.2f  q=%d  btn=%X",
+                hz, braced ? "BRC" : "   ", r, inPush ? "PUSH" : "    ", g_pushDamp, bar,
+                stickX, stickY, axY.smoothVel, axZ.smoothVel, rL, rS, g_recoilForce, qcount, btnMask);
+
+            // ── Contextual lines that appear/clear below the status line ──
+            g_belowCount = 0;
+
+            // Always-on force readout (Newtons), per-second peak hold — watch the
+            // typical band clamp in real time. "raw" is the recoil push before the
+            // band; "out" is what's actually commanded after band + shaping.
+            snprintf(g_belowCache[g_belowCount], 256,
+                "force peak/s: recoil raw=%.2fN out=%.2fN [band %.1f..%.1f]   ambient=%.2fN [band %.1f..%.1f]",
+                g_dbgRecoilRawN, g_dbgRecoilOutN, RECOIL_TYPICAL_MIN_N, RECOIL_TYPICAL_MAX_N,
+                g_dbgAmbientN, AMBIENT_TYPICAL_MIN_N, AMBIENT_TYPICAL_MAX_N);
+            g_belowCount++;
+            g_dbgRecoilRawN = g_dbgRecoilOutN = g_dbgAmbientN = 0.0;   // reset the peak hold for the next second
+
             if (g_debugMode) {
-                printf("\nY: ctr=%+.4f half=%.4f off=%+.2f vel=%+.4f\n",
-                    axY.estCenter, axY.halfRange, offY, axY.smoothVel);
-                printf("Z: ctr=%+.4f half=%.4f off=%+.2f vel=%+.4f\n",
-                    axZ.estCenter, axZ.halfRange, offZ, axZ.smoothVel);
-                printf("r=%.3f  push=%s  damp=%.2f  stk=(%.2f,%.2f)  rbl=%.2f/%.2f  rcl=%.2f  q=%d  btn=%X\n",
-                    r, inPush ? "YES" : "no", g_pushDamp, stickX, stickY,
-                    rL, rS, g_recoilForce, qcount, btnMask);
+                snprintf(g_belowCache[g_belowCount], 256, "Y: ctr=%+.4f half=%.4f off=%+.2f vel=%+.4f",
+                    axY.estCenter, axY.halfRange, offY, axY.smoothVel); g_belowCount++;
+                snprintf(g_belowCache[g_belowCount], 256, "Z: ctr=%+.4f half=%.4f off=%+.2f vel=%+.4f",
+                    axZ.estCenter, axZ.halfRange, offZ, axZ.smoothVel); g_belowCount++;
+                snprintf(g_belowCache[g_belowCount], 256, "push=%s  stk=(%.2f,%.2f)  rbl=%.2f/%.2f  rcl=%.2f  q=%d  btn=%X",
+                    inPush ? "YES" : "no", stickX, stickY, rL, rS, g_recoilForce, qcount, btnMask); g_belowCount++;
                 if (AGC_ENABLE) {
                     double tol = (AGC_TOLERANCE < 1.0) ? 1.0 : AGC_TOLERANCE;
                     double lo = AGC_TARGET / tol, hi = AGC_TARGET * tol;
@@ -1515,19 +1846,12 @@ int main(int argc, char* argv[]) {
                     double eff = g_agcAvg < lo ? lo : (g_agcAvg > hi ? hi : g_agcAvg);
                     double g = (g_agcAvg > 1e-6) ? eff / g_agcAvg : 1.0;
                     g = g < AGC_GAIN_MIN ? AGC_GAIN_MIN : (g > AGC_GAIN_MAX ? AGC_GAIN_MAX : g);
-                    printf("agc: avg=%.3f band=%.3f..%.3f %s level-gain=%.2f\n",
-                        g_agcAvg, lo, hi, inBand ? "IN-BAND (raw)" : "correcting", g);
+                    snprintf(g_belowCache[g_belowCount], 256, "agc: avg=%.3f band=%.3f..%.3f %s level-gain=%.2f",
+                        g_agcAvg, lo, hi, inBand ? "IN-BAND (raw)" : "correcting", g); g_belowCount++;
                 }
             }
-            else {
-                int col = (int)((offY + 1.0) / 2.0 * 8.0 + 0.5);
-                col = col < 0 ? 0 : (col > 8 ? 8 : col);
-                printf("\r%4d Hz  r=%.2f %s  damp=%.2f  [", hz, r, inPush ? "PUSH" : "    ", g_pushDamp);
-                for (int c = 0; c <= 8; c++) printf(c == col ? "O" : ".");
-                printf("]  stk=(%.2f,%.2f)  vel=%.3f/%.3f  rbl=%.2f/%.2f  rcl=%.2f  q=%d  btn=%X   ",
-                    stickX, stickY, axY.smoothVel, axZ.smoothVel, rL, rS, g_recoilForce, qcount, btnMask);
-                fflush(stdout);
-            }
+
+            ConsoleRepaint();   // status + debug lines + persistent notice (drawn as the last line)
             hz = 0; lastStats = now;
         }
 
@@ -1536,18 +1860,20 @@ int main(int argc, char* argv[]) {
             lastKeyCheck = now;
             if (GetAsyncKeyState(VK_F9) & 0x8000) break;
             if (GetAsyncKeyState(VK_F8) & 0x8000) {
-                printf("\nReloading %s...\n", g_configPath);
                 LoadConfig(g_configPath);
                 ApplyDerivedConfig();
                 dhdSetStandardGravity(9.81 * GRAVITY_COMP_SCALE);   // re-apply gravity comp
                 periodTicks = (UPDATE_RATE_MS > 0) ? (qpf.QuadPart * UPDATE_RATE_MS) / 1000 : 0;
                 QueryPerformanceCounter(&qDeadline);                // reset pacing baseline
-                printf("(HALF_RANGE_MAX / serial port changes need F11 recalibrate / restart)\n");
+                char msg[192];
+                snprintf(msg, sizeof(msg), "Reloaded %s  (HALF_RANGE_MAX / serial changes need F11 / restart)", g_configPath);
                 Sleep(200);
+                ConsoleAnchorHere();   // LoadConfig may have printed warnings/appends; pin status below them
+                ConsoleNotice(msg);    // post after re-anchor so it lands in the fresh region
             }
             if (GetAsyncKeyState(VK_F10) & 0x8000) {
                 g_debugMode = !g_debugMode;
-                printf("\nDebug %s\n", g_debugMode ? "ON" : "OFF");
+                ConsoleNotice(g_debugMode ? "Debug ON" : "Debug OFF");
                 Sleep(200);
             }
             if (GetAsyncKeyState(VK_F11) & 0x8000) {
@@ -1571,6 +1897,7 @@ int main(int argc, char* argv[]) {
                 QueryPerformanceCounter(&qLast);      // don't let the 4s calibration produce a giant dt
                 QueryPerformanceCounter(&qDeadline);
                 Sleep(200);
+                ConsoleAnchorHere();   // recalibrate printed several lines; pin the status line below them
             }
         }
 
@@ -1590,7 +1917,10 @@ int main(int argc, char* argv[]) {
                 if (remain <= 0) break;
                 double remainMs = remain * 1000.0 / (double)qpf.QuadPart;
                 if (remainMs > 1.5) Sleep(1);
-                else Sleep(0);
+                else
+                {
+
+                } Sleep(0);
             }
         }
     }
