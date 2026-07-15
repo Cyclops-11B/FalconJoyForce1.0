@@ -14,7 +14,8 @@
 //  - Typical output band: RECOIL_TYPICAL_MIN/MAX_N and AMBIENT_TYPICAL_MIN/MAX_N clamp
 //    the commanded recoil push / ambient magnitude into a user-set Newton band —
 //    above the band -> max, nonzero below the band -> min. TYPICAL_FLOOR_GATE keeps
-//    decaying tails / noise from being raised to the minimum. 0 disables an edge.
+//    decaying tails / noise from being raised to the minimum. 0 disables an edge. 
+//    Reorganized variables into categories.
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
@@ -27,7 +28,9 @@
 
 #pragma comment(lib, "winmm.lib")
 
-
+//Setup and Configuration
+// 
+// 
 // ── Serial port ────────────────────────────────────────────────────────────
 static char  SERIAL_PORT[64] = "\\\\.\\COM6";
 static DWORD SERIAL_BAUD = 115200;
@@ -42,6 +45,21 @@ static int  UPDATE_RATE_MS = 0;  // 0 = unpaced, dhd USB calls throttle the loop
 static bool INVERT_X = false;
 static bool INVERT_Y = false;
 
+// ── Button 2 static friction break / preload ────────────────────────────────
+static double BTN2_X_FORCE = 1.6;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
+static double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
+
+// ── Braced aim mode ──────────────────────────────────────────────────────────
+// Replace a button with a sensitivity multiplyer. 
+static int    BRACE_BUTTON = 0;      // grip button 1-4 (4 = mask bit 8); 0 = disabled (button passes through normally)
+static bool   BRACE_TOGGLE = false;  // false = hold to brace (ADS-style); true = press toggles on/off
+static double BRACE_VEL_SCALE = 0.3; // velocity-zone stick output multiplier while braced
+static double BRACE_PUSH_SCALE = 0.3;// push-zone speed multiplier while braced
+
+
+//Velocity and sensitivity
+// 
+// 
 // ──Velocity settings ──────────────────────────────────────────────────────
 static double VEL_DEADZONE = 0.0001;
 static double VEL_VLOW_SENS = 22.0;    // sensitivity for very slow corrections
@@ -69,18 +87,14 @@ static double POSBLEND_MAX_MULT = 2.0; // posBlendMax = VEL_BLEND_LOW * this —
 static double POSBLEND_SLEW_HZ = 6.0;  // slew on the position-blend amount — a one-frame velMag dip can't snap it
 
 double posBlendMax = VEL_BLEND_LOW * POSBLEND_MAX_MULT;   // derived — recomputed after config load
+
+//Scale of vertical motion
 static double VEL_RELEASE_MULT = 35.0; // decel cutoff multiplier — higher = snappier stop, lower = floatier
 static double VEL_VERTICAL_SCALE = 1.0; // up/down (Z axis) velocity-zone output multiplier; left/right (Y axis) is unaffected. Independent of PUSH_VERTICAL_SCALE
 
-// Flick capture: bank fast motion when saturated
-static double FLICK_VEL_ON = 0.01;   // m/s above which motion is treated as a flick and banked (≈ where the stick saturates)
-static double FLICK_GAIN = 4.0;    // how much banked over-speed becomes extra deflection
-static double FLICK_DECAY = 0.92;   // per-ms decay of the carry tail — lower = shorter tail
-static double FLICK_CARRY_MAX = 0.9;    // clamp on carry deflection so big flicks don't over-throw
-
 // Push zone variables
-static double PUSH_ENTER_RAD = 0.84; // percentage of work radius where push zone kicks in
-static double PUSH_EXIT_RAD = 0.84; // percentage of work radius where push zone stops acting
+static double PUSH_ENTER_RAD = 0.81; // percentage of work radius where push zone kicks in
+static double PUSH_EXIT_RAD = 0.81; // percentage of work radius where push zone stops acting
 static double PUSH_SPEED_BASE = 0.64; // how fast cursor moves when entering push zone
 static double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
 static double PUSH_VERTICAL_SCALE = 0.5; // up/down (Z axis) push-speed multiplier; left/right (Y axis) is unaffected
@@ -92,54 +106,6 @@ static double CALIB_FILL = 0.95;        // fraction of measured reach that maps 
 static double CALIB_MIN = 0.025;       // reject implausibly small sweeps (m)
 static double CALIB_MAX = 0.120;       // reject implausibly large sweeps (m)
 
-// Push zone re-entry damping
-static double PUSH_DAMP_COEFF = 0.9; // damping strength on direction reversal (0=none, 1=strong)
-static double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
-
-// ── Boundary detent: a ridge you push over right before the push zone ─────────
-static double DETENT_WIDTH = 0.12; // fraction of work radius over which the ridge builds
-static double DETENT_PEAK_N = 1.4;  // ridge height in N — resistance grows, then releases at threshold
-static double EDGE_HYST = 0.02;        // fraction of work radius of SPATIAL hysteresis on the pop latch at the push border. Once popped through, the ridge stays released (and the pump won't fire) until r retreats this far back inside — stops mm-wobble on the border from strobing the wall on/off
-
-// ── Exit pump: a brief inward kick right at the border when leaving the push zone ──
-static double PUMP_PEAK_N = 1.3;  // kick strength (N) as you cross back out of push
-static double PUMP_DECAY = 0.90;  // per-ms decay of the kick — lower = snappier/shorter pump
-
-//  Feed forward variables ────────────────────────────────────────────────────────
-static double FRICTION_CANCEL = .14;    // feed forward force in Newtons
-static double FRICTION_VEL_MIN = 0.003;  // engage threshold — WAS shadowed to 0.003 inside ApplyForces; default now matches the value you've actually been feeling
-static double FRICTION_VEL_FULL = 0.004;  // assist reaches full here (fixed window, not tied to MIN)
-static double FRICTION_VEL_MAX = 0.08;   // faded back out by here
-
-static double STICTION_BREAK_N = 0.09;   // constant breakaway force (N)
-static double STICTION_VEL_ON = 0.0005; // motion floor (= your SHORT_VEL_NOISE)
-
-// Viscous drag cancellation — the Falcon's drag grows with speed (back-EMF, bearing
-// viscosity); Coulomb cancel is constant-magnitude and can't touch that component.
-static double VISCOUS_CANCEL = 0.0;   // N per (m/s) along velocity. 0 = off. Start ~1.0, raise until fast sweeps feel free; too high = self-driving/instability against the wall
-static double VISCOUS_MAX_N = 0.6;    // hard cap on the viscous assist contribution (safety against runaway at high speed)
-
-// Stiction dither — tiny high-frequency circular force that keeps the mechanism in
-// kinetic (never static) friction, killing the re-grip catch at reversals and the
-// start of micro-corrections. Fades out with speed: only needed near-stopped.
-static double DITHER_N = 0.0;         // amplitude (N). 0 = off. Try 0.05-0.12; if the crosshair picks up jitter, lower this (or nudge SHORT_VEL_NOISE up)
-static double DITHER_HZ = 70.0;       // dither frequency — high enough to not read as motion, low enough for the motors to render
-static double DITHER_VEL_FADE = 0.010; // m/s above which dither is fully faded out
-
-// ── Button 2 brace / preload ─────────────────────────────────────────────────
-static double BTN2_X_FORCE = 1.6;  // constant X force while button 2 held (N) — preloads mechanism for fine corrections
-static double BTN2_X_SIGN = 1.0;  // +1 or -1 to flip push direction
-
-// ── Braced aim mode ──────────────────────────────────────────────────────────
-// A grip button becomes a sensitivity brace instead of a controller button:
-// while braced, velocity-zone stick output and push-zone speed are scaled down
-// for precision aiming. The button is CONSUMED — masked out of the packet sent
-// to the Pico, so the game never sees it.
-static int    BRACE_BUTTON = 0;      // grip button 1-4 (4 = mask bit 8); 0 = disabled (button passes through normally)
-static bool   BRACE_TOGGLE = false;  // false = hold to brace (ADS-style); true = press toggles on/off
-static double BRACE_VEL_SCALE = 0.3; // velocity-zone stick output multiplier while braced
-static double BRACE_PUSH_SCALE = 0.3;// push-zone speed multiplier while braced
-
 //  Spring box ─────────────────────────────────────────────────────────────────────
 static double FORCE_SPRING_START = 0.78; // percentage of work radius where spring force starts
 static double FORCE_MAX_RAD = 0.95; // percentage of work radius where max force is achieved
@@ -150,9 +116,59 @@ static double DAMP_VEL_MIN = 0.010; // below this speed = no ENHANCED wall dampi
 static double DAMP_VEL_MAX = 0.020; // above this speed = full enhanced damping (smoothstepped between)
 static double FORCE_YZ_CAP_N = 7.8; // hard cap on combined Y/Z force magnitude (spring + lateral rumble)
 
+// Push zone re-entry damping ───────────────────────────────────────────────────
+static double PUSH_DAMP_COEFF = 0.9; // damping strength on direction reversal (0=none, 1=strong)
+static double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
+
+// ── Boundary detent: a ridge you push over right before the push zone ─────────
+static double DETENT_WIDTH = 0.12; // fraction of work radius over which the ridge builds
+static double DETENT_PEAK_N = 1.4;  // ridge height in N — resistance grows, then releases at threshold
+static double EDGE_HYST = 0.02;        // fraction of work radius of SPATIAL hysteresis on the pop latch at the push border. Once popped through, the ridge stays released (and the pump won't fire) until r retreats this far back inside — stops mm-wobble on the border from strobing the wall on/off
+
+// ── Exit kick: tactile kick when leaving the push zone ────────────────────────
+static double PUMP_PEAK_N = 1.3;  // kick strength (N) as you cross back out of push
+static double PUMP_DECAY = 0.90;  // per-ms decay of the kick — lower = snappier/shorter pump
+
+
+//Friction and smoothness features
+// 
+// 
+// Feed forward variables ────────────────────────────────────────────────────────
+static double FRICTION_CANCEL = .14;    // feed forward force in Newtons
+static double FRICTION_VEL_MIN = 0.003;  // engage threshold — WAS shadowed to 0.003 inside ApplyForces; default now matches the value you've actually been feeling
+static double FRICTION_VEL_FULL = 0.004;  // assist reaches full here (fixed window, not tied to MIN)
+static double FRICTION_VEL_MAX = 0.08;   // faded back out by here
+
+// Stiction break ──────────────────────────────────────────────────────────────────
+static double STICTION_BREAK_N = 0.09;   // constant breakaway force (N)
+static double STICTION_VEL_ON = 0.0005; // motion floor (= your SHORT_VEL_NOISE)
+
+// Viscous drag cancellation — the Falcon's drag grows with speed (back-EMF, bearing
+// viscosity); Coulomb cancel is constant-magnitude and can't touch that component.
+static double VISCOUS_CANCEL = 0.0;   // N per (m/s) along velocity. 0 = off. Start ~1.0, raise until fast sweeps feel free; too high = self-driving/instability against the wall
+static double VISCOUS_MAX_N = 0.6;    // hard cap on the viscous assist contribution (safety against runaway at high speed)
+
+// Stiction dither — tiny high-frequency circular force that keeps the mechanism in
+// kinetic (never static) friction. Fades out with speed: only needed near-stopped.
+static double DITHER_N = 0.0;         // amplitude (N). 0 = off. Try 0.05-0.12; if the crosshair picks up jitter, lower this (or nudge SHORT_VEL_NOISE up)
+static double DITHER_HZ = 70.0;       // dither frequency — high enough to not read as motion, low enough for the motors to render
+static double DITHER_VEL_FADE = 0.010; // m/s above which dither is fully faded out
+
+// Performance features
+// 
+// 
 //  Gravity Compensation ────────────────────────────────────────────────────────────
 static double GRAVITY_COMP_SCALE = 1.65;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
 
+// Flick capture: bank fast motion when saturated
+static double FLICK_VEL_ON = 0.01;   // m/s above which motion is treated as a flick and banked (≈ where the stick saturates)
+static double FLICK_GAIN = 4.0;    // how much banked over-speed becomes extra deflection
+static double FLICK_DECAY = 0.92;   // per-ms decay of the carry tail — lower = shorter tail
+static double FLICK_CARRY_MAX = 0.9;    // clamp on carry deflection so big flicks don't over-throw
+
+// Rumble and Recoil
+// 
+// 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
 static double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
 static double AMBIENT_SMALL_SCALE = 5.5;  // random rumble force scale
@@ -242,28 +258,6 @@ static inline double ApplyTypicalBand(double f, double bandMin, double bandMax) 
     if (bandMin > 0.0 && f < bandMin) f = bandMin;      // below the band -> normalized to min
     return f;
 }
-
-// ── Idle recentering ─────────────────────────────────────────────────────────
-// Recoil compensation drags the handle toward the bottom of the work circle.
-// During genuine idle (no recoil/rumble/push/brace, velocity quiet for
-// RECENTER_DELAY_MS) an INTEGRATING FORCE SERVO pulls toward center: force
-// builds from zero at RECENTER_GAIN_NPS until the handle actually breaks
-// stiction and starts drifting, then self-regulates to hold RECENTER_DRIFT_MPS
-// (builds when slower, backs off when faster) — so it always finds exactly the
-// force this mechanism needs, no more. It stops integrating just outside the
-// center deadband, releases entirely inside it, and cuts almost instantly
-// (RECENTER_CUT_HZ, integrator reset) the moment any activity resumes. While
-// the servo is actively drifting the handle, user-motion detection switches to
-// the higher RECENTER_VEL_BREAK threshold so the servo's own slow drift doesn't
-// read as activity and stall it.
-static double RECENTER_MAX_N     = 1.2;    // servo force cap (N); 0 = feature off
-static double RECENTER_GAIN_NPS  = 0.15;   // build rate (N/s) at standstill -- how fast force grows until motion starts
-static double RECENTER_DRIFT_MPS = 0.002;  // target inward drift speed (m/s) the servo regulates to once moving
-static double RECENTER_DEADZONE  = 0.15;   // fraction of work radius: inside = released (force 0, integrator reset)
-static DWORD  RECENTER_DELAY_MS  = 1200;   // continuous quiet time required before engaging
-static double RECENTER_VEL_QUIET = 0.003;  // m/s -- motion above this counts as activity while DISENGAGED
-static double RECENTER_VEL_BREAK = 0.010;  // m/s -- motion above this counts as activity while ENGAGED (user grabbing it)
-static double RECENTER_CUT_HZ    = 10.0;   // disengage cutoff -- force is gone within ~100ms of any activity
 
 
 // ── Config file ──────────────────────────────────────────────────────────────
@@ -446,16 +440,6 @@ static CfgEntry g_cfgTable[] = {
     C_D(AMBIENT_TYPICAL_MIN_N, "ambient magnitude floor (N); 0 = no floor"),
     C_D(AMBIENT_TYPICAL_MAX_N, "ambient magnitude ceiling (N); 0 = no ceiling"),
     C_D(TYPICAL_FLOOR_GATE,    "forces below this (N) count as silence and are NOT raised to the floor (lets tails decay to 0)"),
-
-    SEC("Idle recentering"),
-    C_D(RECENTER_MAX_N,     "servo force cap (N) pulling toward center during idle; 0 = off"),
-    C_D(RECENTER_GAIN_NPS,  "force build rate (N/s) at standstill -- grows until the handle breaks free and drifts"),
-    C_D(RECENTER_DRIFT_MPS, "target inward drift speed (m/s) the servo holds once moving"),
-    C_D(RECENTER_DEADZONE,  "fraction of work radius: inside = released, force 0"),
-    C_U(RECENTER_DELAY_MS,  "continuous quiet time (ms) before the servo engages"),
-    C_D(RECENTER_VEL_QUIET, "m/s -- motion above this counts as activity while disengaged"),
-    C_D(RECENTER_VEL_BREAK, "m/s -- motion above this counts as activity while engaged (so the servo's own drift doesn't stall it)"),
-    C_D(RECENTER_CUT_HZ,    "disengage cutoff (Hz) -- how fast the pull vanishes when activity resumes"),
 };
 static const int g_cfgCount = (int)(sizeof(g_cfgTable) / sizeof(g_cfgTable[0]));
 
@@ -620,11 +604,6 @@ static void ApplyDerivedConfig() {
     if (AMBIENT_TYPICAL_MAX_N > 0.0 && AMBIENT_TYPICAL_MIN_N > AMBIENT_TYPICAL_MAX_N)
         AMBIENT_TYPICAL_MIN_N = AMBIENT_TYPICAL_MAX_N;
     if (TYPICAL_FLOOR_GATE < 0.0) TYPICAL_FLOOR_GATE = 0.0;
-    // Recenter servo sanity
-    if (RECENTER_DEADZONE < 0.0) RECENTER_DEADZONE = 0.0;
-    if (RECENTER_DRIFT_MPS < 0.0005) RECENTER_DRIFT_MPS = 0.0005;   // must sit above the velocity-estimation floor or the servo can't see its own drift
-    if (RECENTER_VEL_BREAK < RECENTER_VEL_QUIET) RECENTER_VEL_BREAK = RECENTER_VEL_QUIET;
-    if (RECENTER_MAX_N > FORCE_YZ_CAP_N) RECENTER_MAX_N = FORCE_YZ_CAP_N;
 }
 
 
@@ -668,7 +647,7 @@ static double g_recoilForce = 0.0;
 // so a plain snapshot would almost always read 0 between shots.
 static double g_dbgRecoilRawN = 0.0;   // recoil X push before the typical band (peak)
 static double g_dbgRecoilOutN = 0.0;   // recoil X push actually commanded (peak, post band + shaping + preload)
-static double g_dbgAmbientN   = 0.0;   // ambient/rumble Y/Z magnitude actually commanded (peak)
+static double g_dbgAmbientN = 0.0;   // ambient/rumble Y/Z magnitude actually commanded (peak)
 static DWORD  g_btn1Released = 0;
 static double g_pushDamp = 0.0;
 static volatile float g_rumbleLargePeak = 0.0f;  // undecayed, for sustain check
@@ -1170,13 +1149,13 @@ static void ApplyForces(double y, double z,
 // relevant, so the terminal doesn't scroll during normal operation. Absolute
 // cursor positioning (Win32 console API) is used instead of '\r' so the block
 // below the status line can grow and shrink cleanly.
-static HANDLE g_hCon        = INVALID_HANDLE_VALUE;
-static SHORT  g_conAnchorY  = -1;    // buffer row the status line is pinned to (-1 = no console → plain printf fallback)
+static HANDLE g_hCon = INVALID_HANDLE_VALUE;
+static SHORT  g_conAnchorY = -1;    // buffer row the status line is pinned to (-1 = no console → plain printf fallback)
 static int    g_conPrevLines = 0;    // lines drawn last frame, so a shrinking block clears its leftovers
-static int    g_conWidth    = 120;
+static int    g_conWidth = 120;
 static char   g_statusLine[256] = "";  // cached pinned status line (row 0)
 static char   g_belowCache[6][256];    // cached contextual lines (debug detail, AGC…)
-static int    g_belowCount  = 0;       // how many of g_belowCache are live
+static int    g_belowCount = 0;       // how many of g_belowCache are live
 static char   g_notice[160] = "";      // latest event message; persists until a newer one replaces it
 
 // (Re)capture the anchor at the CURRENT cursor row. Called once after startup,
@@ -1189,7 +1168,8 @@ static void ConsoleAnchorHere() {
         g_conWidth = csbi.dwSize.X;
         if (g_conWidth < 40)  g_conWidth = 40;
         if (g_conWidth > 240) g_conWidth = 240;
-    } else {
+    }
+    else {
         g_conAnchorY = -1;   // redirected / no console: fall back to plain prints
     }
     g_conPrevLines = 0;
@@ -1713,66 +1693,8 @@ int main(int argc, char* argv[]) {
 
         double outX = rumX;                                      // final recoil X push (post band/shaping/preload)
         double outYZ = sqrt(rumY * rumY + rumZ * rumZ);          // ambient + lateral-texture magnitude
-        if (fabs(outX)  > fabs(g_dbgRecoilOutN)) g_dbgRecoilOutN = outX;   // per-second peak holds
-        if (outYZ       > g_dbgAmbientN)         g_dbgAmbientN   = outYZ;
-
-        // ── Idle recentering (integrating force servo) ────────────────────────────
-        // Injected AFTER the force readout capture so it doesn't pollute the ambient
-        // peak. See the config block for the full rationale.
-        if (RECENTER_MAX_N > 0.0) {
-            static double recenterEnv = 0.0;          // 0..1 engage envelope (fast cut on activity)
-            static double recenterI = 0.0;            // integrated servo force (N)
-            static DWORD  recenterQuietStart = 0;     // start of the current quiet stretch
-
-            double velMag = sqrt(axY.smoothVel * axY.smoothVel + axZ.smoothVel * axZ.smoothVel);
-            bool rumbleFreshRC = (now - g_lastRumbleTime) < RUMBLE_FRESH_MS;
-            // While the servo is drifting the handle, its own slow motion must not
-            // read as "user activity" — switch to the higher BREAK threshold.
-            bool servoLive = (recenterEnv > 0.5 && recenterI > 0.0);
-            double velGate = servoLive ? RECENTER_VEL_BREAK : RECENTER_VEL_QUIET;
-            bool activity = recoilActive || g_recoilFiring || g_recoilTailActive
-                         || rumbleFreshRC || inPush || braced
-                         || velMag > velGate;
-            if (activity) recenterQuietStart = now;
-
-            bool engaged = !activity && (now - recenterQuietStart >= RECENTER_DELAY_MS);
-
-            // Envelope: instant-on permission when engaged (the servo itself starts
-            // from zero force, so onset is inherently gradual); fast fade on activity.
-            if (engaged) {
-                recenterEnv = 1.0;
-            } else {
-                double aCut = 1.0 - exp(-2.0 * 3.14159265 * RECENTER_CUT_HZ * dt);
-                recenterEnv += aCut * (0.0 - recenterEnv);
-                if (recenterEnv < 0.001) { recenterEnv = 0.0; recenterI = 0.0; }   // full reset: next engage rebuilds from zero
-            }
-
-            double rNorm = sqrt(offY * offY + offZ * offZ);   // normalized radial offset
-            if (recenterEnv > 0.0 && rNorm > 1e-6) {
-                if (rNorm <= RECENTER_DEADZONE) {
-                    recenterI = 0.0;   // reached center: release and stay released until re-engagement further out
-                } else if (engaged) {
-                    // Inward radial speed: project velocity onto the outward unit vector, negate.
-                    double vRad = (offY / rNorm) * axY.smoothVel + (offZ / rNorm) * axZ.smoothVel;   // + = outward
-                    double inwardSpd = -vRad;
-                    // Integrate on drift-speed error: standstill -> builds at GAIN_NPS
-                    // until stiction breaks; at target speed -> holds; too fast -> backs
-                    // off at the same rate. Error normalized by the target so GAIN_NPS
-                    // is the honest build rate in N/s regardless of the target chosen.
-                    double err = (RECENTER_DRIFT_MPS - inwardSpd) / RECENTER_DRIFT_MPS;
-                    if (err > 1.0) err = 1.0;      // can't build faster than GAIN_NPS…
-                    if (err < -2.0) err = -2.0;    // …but may unwind up to 2x as fast if overspeeding
-                    recenterI += RECENTER_GAIN_NPS * err * dt;
-                    if (recenterI < 0.0) recenterI = 0.0;
-                    if (recenterI > RECENTER_MAX_N) recenterI = RECENTER_MAX_N;
-                }
-                double mag = recenterI * recenterEnv;
-                if (mag > 0.0) {
-                    rumY += (-offY / rNorm) * mag;   // unit vector toward center
-                    rumZ += (-offZ / rNorm) * mag;
-                }
-            }
-        }
+        if (fabs(outX) > fabs(g_dbgRecoilOutN)) g_dbgRecoilOutN = outX;   // per-second peak holds
+        if (outYZ > g_dbgAmbientN)         g_dbgAmbientN = outYZ;
 
         ApplyForces(y, z, axY, axZ, axY.smoothVel, axZ.smoothVel, rumX, rumY, rumZ, dt);
 
