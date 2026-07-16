@@ -246,9 +246,9 @@ static volatile double g_agcAvg = 0.0;  // learned average (0 = unseeded; first 
 // behavior identical to before). TYPICAL_FLOOR_GATE: inputs below this are
 // treated as silence and NOT raised to the min — without it the exponentially
 // decaying rumble tail (which never quite reaches zero) would pin output at min.
-static double RECOIL_TYPICAL_MIN_N = 2.5;  // recoil push floor (N); 0 = no floor
+static double RECOIL_TYPICAL_MIN_N = 4.5;  // recoil push floor (N); 0 = no floor
 static double RECOIL_TYPICAL_MAX_N = 0.0;  // recoil push ceiling (N); 0 = no ceiling (FORCE_MAX_N still caps)
-static double AMBIENT_TYPICAL_MIN_N = 3.0; // ambient magnitude floor (N); 0 = no floor
+static double AMBIENT_TYPICAL_MIN_N = 3.2; // ambient magnitude floor (N); 0 = no floor
 static double AMBIENT_TYPICAL_MAX_N = 9.0; // ambient magnitude ceiling (N); 0 = no ceiling (FORCE_YZ_CAP_N still caps)
 static double TYPICAL_FLOOR_GATE = 0.05;   // commanded force (N) below this counts as silence for the floor
 
