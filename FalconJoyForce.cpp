@@ -98,6 +98,22 @@ static double PUSH_EXIT_RAD = 0.81; // percentage of work radius where push zone
 static double PUSH_SPEED_BASE = 0.64; // how fast cursor moves when entering push zone
 static double PUSH_SPEED_MAX = 6.0; // maximum push speed at full tilt
 static double PUSH_VERTICAL_SCALE = 0.5; // up/down (Z axis) push-speed multiplier; left/right (Y axis) is unaffected
+// ── Push direction ────────────────────────────────────────────────────────────
+// Decided ONCE, at the moment you cross the border, from POSITION ONLY, then held.
+// Nothing velocity-derived steers it: smoothVel is noise near zero (and is modified
+// upstream by the recoil bleed), which is what made velocity-steered attempts wander.
+static bool   PUSH_SNAP_CARDINAL = true;    // quantize the push to straight up/down/left/right
+static double PUSH_ENTRY_SMOOTH_HZ = 6.0;   // lag of the reference used to read your approach direction at the crossing (~26ms of history); lower = more history, steadier
+static double PUSH_ENTRY_MIN_TRAVEL = 0.005;// approach shorter than this (offset units; x HALF_RANGE_MAX for metres) is unreadable -> fall back to radial position
+static double PUSH_REAIM_TRAVEL = 0.12;     // handle travel since the direction was set that re-aims it (0.12 ~= 7mm at HALF_RANGE_MAX 0.06). 0 = NEVER re-aim until you leave the push zone
+static DWORD  PUSH_MIN_MS = 150;            // minimum ms latched in push. Border tremor otherwise strobes inPush, and EVERY exit slams g_pushDamp to 1.0, blanking all stick output for ~330ms
+static double PUSH_EXIT_MIN_HYST = 0.05;    // enforced deadband between PUSH_ENTER_RAD and PUSH_EXIT_RAD
+
+// RETIRED by the position-only direction logic (kept so existing configs don't warn):
+static double PUSH_SNAP_RATIO = 2.5;
+static double PUSH_DIR_FROM_MOTION = 1.0;
+static double PUSH_DIR_SLEW_HZ = 10.0;
+static double PUSH_DIR_VEL_MIN = 0.006;
 static double HALF_RANGE_MAX = 0.06; // how large work radius is (in m) — config changes take effect on next F11 recalibrate
 
 // Velocity zone stuff
@@ -134,7 +150,7 @@ static double PUMP_DECAY = 0.90;  // per-ms decay of the kick — lower = snappi
 // 
 // 
 // Feed forward variables ────────────────────────────────────────────────────────
-static double FRICTION_CANCEL = .14;    // feed forward force in Newtons
+static double FRICTION_CANCEL = .18;    // feed forward force in Newtons
 static double FRICTION_VEL_MIN = 0.003;  // engage threshold — WAS shadowed to 0.003 inside ApplyForces; default now matches the value you've actually been feeling
 static double FRICTION_VEL_FULL = 0.004;  // assist reaches full here (fixed window, not tied to MIN)
 static double FRICTION_VEL_MAX = 0.08;   // faded back out by here
@@ -190,6 +206,13 @@ static double RECOIL_DECAY = 0.45;
 static double RECOIL_DECAY_MIN = 0.25;  // decay for weak shots (fast cutoff)
 static double RECOIL_DECAY_MAX = 0.75;  // decay for strong shots (long sustain)
 static double RECOIL_MAG_SCALE = 20.0;  // liveMag value that maps to DECAY_MAX
+// ── Recoil drive mapping (replaces the RECOIL_X_SCALE overdrive-then-clamp) ──
+// Kick force and per-shot decay are both driven by liveMag normalized against a
+// fullscale reference, so the whole input range maps onto the whole output range
+// instead of everything above a sliver pinning FORCE_MAX_N.
+static double RECOIL_FULLSCALE = 0.0;    // liveMag treated as a maximum-strength shot; 0 = auto (RUMBLE_LARGE_SCALE + RUMBLE_SMALL_SCALE = both motors at 100%)
+static double RECOIL_DRIVE_CURVE = 0.65; // kick force curve: 1.0 = linear (max separation); lower boosts weak shots toward the old always-hard feel
+static double RECOIL_TIME_CURVE = 1.0;   // duration curve on the DECAY_MIN..MAX mapping: >1 reserves the long sustain for only the strongest shots
 static double RECOIL_AIM_DAMP = 0.4;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
 static double RECOIL_DAMP_DECAY = 8.0;  // how fast aim damp fades per second
 static double RECOIL_PUSH_SCALE = 20.0;  // sustained push force multiplier
@@ -201,7 +224,7 @@ static double RECOIL_ATTACK_SEC = 0.0;
 static DWORD MIN_EDGE_INTERVAL_MS = 35;   // longer than a single-shot envelope
 
 static DWORD  RECOIL_DIR_CHANGE_MS = 40;  // how often direction randomizes (same as ambient)
-static double RECOIL_X_SCALE = 20.0;      // backwards kick strength
+static double RECOIL_X_SCALE = 20.0;      // backwards kick strength (RETIRED by the drive mapping — kept so old configs don't warn)
 static double RECOIL_RELEASE_HZ = 12.0;   // release shaping: low-pass cutoff for the recoil push on the way DOWN only. Higher = sharper release, lower = smoother/longer. (Up-edges pass instantly so the kick stays crisp.)
 static double RECOIL_VERTICAL = 10.0;  // upward force as fraction of recoil (0=none, 1=equal to X)
 //static double RECOIL_Z_RETURN_RATE = 0.2;  // how fast debt bleeds back (higher = snappier return)
@@ -257,6 +280,26 @@ static inline double ApplyTypicalBand(double f, double bandMin, double bandMax) 
     if (bandMax > 0.0 && f > bandMax) f = bandMax;      // above the band -> normalized to max
     if (bandMin > 0.0 && f < bandMin) f = bandMin;      // below the band -> normalized to min
     return f;
+}
+
+// ── Recoil drive mapping helpers ─────────────────────────────────────────────
+static double g_recoilFullscale = 6.8;   // derived after every config (re)load
+
+static inline double RecoilNorm(double mag) {
+    double n = (g_recoilFullscale > 1e-6) ? mag / g_recoilFullscale : 0.0;
+    return n < 0.0 ? 0.0 : (n > 1.0 ? 1.0 : n);
+}
+// Kick force: LANDS on FORCE_MAX_N at fullscale instead of overdriving through it,
+// so shot amplitude survives to the handle instead of being amputated by the clamp.
+static inline double RecoilKickN(double mag) {
+    return FORCE_MAX_N * pow(RecoilNorm(mag), RECOIL_DRIVE_CURVE);
+}
+// Per-shot decay: the full DECAY_MIN..MAX span across the real signal range.
+// (Old magT = liveMag/RECOIL_MAG_SCALE topped out at ~0.34, so DECAY_MAX was
+// effectively unreachable and every shot died at nearly the same rate.)
+static inline double RecoilDecayFor(double mag) {
+    double t = pow(RecoilNorm(mag), RECOIL_TIME_CURVE);
+    return RECOIL_DECAY_MIN + t * (RECOIL_DECAY_MAX - RECOIL_DECAY_MIN);
 }
 
 
@@ -335,6 +378,16 @@ static CfgEntry g_cfgTable[] = {
     C_D(CALIB_MAX,          "reject implausibly large calibration sweeps (m)"),
     C_D(PUSH_DAMP_COEFF,    "stick damping strength on push-zone direction reversal (0=none, 1=strong)"),
     C_D(PUSH_DAMP_DECAY,    "how quickly reversal damping fades (higher = faster)"),
+    C_B(PUSH_SNAP_CARDINAL,  "quantize push to up/down/left/right by crossing direction"),
+    C_D(PUSH_ENTRY_SMOOTH_HZ,"lag of the approach-direction reference at the crossing; lower = steadier"),
+    C_D(PUSH_ENTRY_MIN_TRAVEL,"approach shorter than this is unreadable -> use radial position instead"),
+    C_D(PUSH_REAIM_TRAVEL,   "handle travel that re-aims the push (0.12 ~= 7mm); 0 = never re-aim until you exit"),
+    C_U(PUSH_MIN_MS,         "minimum ms latched in push -- stops border tremor strobing the zone"),
+    C_D(PUSH_EXIT_MIN_HYST,  "enforced deadband between PUSH_ENTER_RAD and PUSH_EXIT_RAD"),
+    C_D(PUSH_SNAP_RATIO,     "RETIRED (position-only direction) -- kept so old configs don't warn"),
+    C_D(PUSH_DIR_FROM_MOTION,"RETIRED -- kept so old configs don't warn"),
+    C_D(PUSH_DIR_SLEW_HZ,    "RETIRED -- kept so old configs don't warn"),
+    C_D(PUSH_DIR_VEL_MIN,    "RETIRED -- kept so old configs don't warn"),
 
     SEC("Boundary detent & exit pump"),
     C_D(DETENT_WIDTH,       "fraction of work radius over which the ridge builds"),
@@ -399,7 +452,10 @@ static CfgEntry g_cfgTable[] = {
     C_D(RECOIL_DECAY,         "initial per-ms decay (overwritten per shot by MIN..MAX mapping)"),
     C_D(RECOIL_DECAY_MIN,     "per-ms decay for weak shots (fast cutoff)"),
     C_D(RECOIL_DECAY_MAX,     "per-ms decay for strong shots (long sustain)"),
-    C_D(RECOIL_MAG_SCALE,     "liveMag that maps to DECAY_MAX -- raise so fewer shots get the long sustain"),
+    C_D(RECOIL_MAG_SCALE,     "RETIRED by the drive mapping (norm now vs RECOIL_FULLSCALE) -- kept so old configs don't warn"),
+    C_D(RECOIL_FULLSCALE,     "liveMag treated as a max-strength shot; 0 = auto (LARGE_SCALE + SMALL_SCALE)"),
+    C_D(RECOIL_DRIVE_CURVE,   "kick force curve: 1 = linear separation; lower boosts weak shots"),
+    C_D(RECOIL_TIME_CURVE,    "duration curve: >1 reserves long sustain for the strongest shots"),
     C_D(RECOIL_AIM_DAMP,      "stick sensitivity multiplier during recoil (0=frozen, 1=no effect)"),
     C_D(RECOIL_DAMP_DECAY,    "how fast aim damp fades per second -- raise if aim feels muddy after bursts"),
     C_D(RECOIL_PUSH_SCALE,    "sustained push force multiplier"),
@@ -409,7 +465,7 @@ static CfgEntry g_cfgTable[] = {
     C_D(RECOIL_ATTACK_SEC,    "attack envelope length (0 = instant kick)"),
     C_U(MIN_EDGE_INTERVAL_MS, "minimum ms between edges counted as new impulses"),
     C_U(RECOIL_DIR_CHANGE_MS, "ms between lateral texture direction randomizations"),
-    C_D(RECOIL_X_SCALE,       "backwards kick strength"),
+    C_D(RECOIL_X_SCALE,       "RETIRED by the drive mapping (kick = FORCE_MAX_N * norm^DRIVE_CURVE) -- kept so old configs don't warn"),
     C_D(RECOIL_RELEASE_HZ,    "down-ramp low-pass; higher = sharper release (past ~30 the sawtooth buzz returns); up-edges pass instantly"),
     C_D(RECOIL_VERTICAL,      "upward force as fraction of recoil (0=none)"),
     C_D(EDGE_THRESHOLD,       "rising-edge size considered a new impulse"),
@@ -595,6 +651,14 @@ static bool LoadConfig(const char* path) {
 // Anything derived from config values goes here — called after every (re)load.
 static void ApplyDerivedConfig() {
     posBlendMax = VEL_BLEND_LOW * POSBLEND_MAX_MULT;
+    // Push latch needs a real deadband. With EXIT == ENTER, mm-scale wobble on the
+    // border strobes inPush, and every exit slams g_pushDamp to 1.0 (killing ALL
+    // stick output for ~330ms). Simulated at 1.5mm tremor: 101 exits/sec.
+    if (PUSH_EXIT_MIN_HYST < 0.0) PUSH_EXIT_MIN_HYST = 0.0;
+    if (PUSH_EXIT_RAD > PUSH_ENTER_RAD - PUSH_EXIT_MIN_HYST)
+        PUSH_EXIT_RAD = PUSH_ENTER_RAD - PUSH_EXIT_MIN_HYST;
+    g_recoilFullscale = (RECOIL_FULLSCALE > 0.0) ? RECOIL_FULLSCALE
+        : (RUMBLE_LARGE_SCALE + RUMBLE_SMALL_SCALE);
     if (VEL_WINDOW_SAMPLES < 2) VEL_WINDOW_SAMPLES = 2;   // history arrays are sized 8 —
     if (VEL_WINDOW_SAMPLES > 8) VEL_WINDOW_SAMPLES = 8;   // clamp so indexing can never overrun
     if (VEL_ZERO_FRAMES < 1) VEL_ZERO_FRAMES = 1;
@@ -648,6 +712,33 @@ static double g_recoilForce = 0.0;
 static double g_dbgRecoilRawN = 0.0;   // recoil X push before the typical band (peak)
 static double g_dbgRecoilOutN = 0.0;   // recoil X push actually commanded (peak, post band + shaping + preload)
 static double g_dbgAmbientN = 0.0;   // ambient/rumble Y/Z magnitude actually commanded (peak)
+
+// ── Force telemetry graph (in/out sparklines) ───────────────────────────────
+// Two scrolling ASCII sparkline rows in the pinned region: force the game is
+// asking for (IN = raw rumble demand) vs force actually commanded to the Falcon
+// (OUT = |fx,fy,fz| in N, captured in ApplyForces). Peak-held per time bucket so
+// a 1 ms spike survives; the ring advances once per GRAPH_BUCKETMS and the rows
+// redraw on their own ~GRAPH_RENDERMS cadence, decoupled from the 1 Hz status
+// tick so the trace scrolls smoothly. ASCII ramp (1 byte/col) keeps ConWriteLine's
+// byte-based width/pad math correct — Unicode blocks would break its truncation.
+static const int    GRAPH_WIDTH = 60;     // columns of history (x BUCKETMS = visible span)
+static const double GRAPH_BUCKETMS = 70.0;   // ms per column: 10 => 100 Hz sampling, ~0.6 s shown
+static const double GRAPH_RENDERMS = 150.0;   // row redraw interval (50 is ~20 Hz)
+static const double GRAPH_OUT_GATE_N = 1.0;  // OUT telemetry squelch (N): commanded force below this reads 0 on the graph/readout so the friction-comp baseline during plain motion doesn't paint the trace. 0 = no gate.
+static double g_graphIn[GRAPH_WIDTH] = { 0 };
+static double g_graphOut[GRAPH_WIDTH] = { 0 };
+static int    g_graphHead = 0;           // next write slot; oldest sample lives here
+static double g_bucketInMax = 0.0;         // peak-hold within the bucket currently filling
+static double g_bucketOutMax = 0.0;
+static double g_graphBucketMs = 0.0;         // ms accumulated in the current bucket
+static double g_graphRenderMs = 0.0;         // ms since last row redraw
+static double g_lastForceIn = 0.0;         // set each loop (raw rumble demand)
+static double g_lastForceOut = 0.0;         // set inside ApplyForces at the dhdSetForce call
+static double g_graphInPeak = 0.0;         // eased display scale for the IN row (auto-ranges)
+static double g_graphOutPeak = 0.0;         // eased display scale for the OUT row
+static bool   g_graphReady = false;       // false until the first bucket is pushed
+static char   g_graphRowIn[256] = "";       // cached IN  sparkline line
+static char   g_graphRowOut[256] = "";       // cached OUT sparkline line
 static DWORD  g_btn1Released = 0;
 static double g_pushDamp = 0.0;
 static volatile float g_rumbleLargePeak = 0.0f;  // undecayed, for sustain check
@@ -927,57 +1018,95 @@ struct AxisState {
 };
 
 // ── Push zone ─────────────────────────────────────────────────────────────
+// LATCH is radial (r), matching the spring/detent/pump geometry. The original
+// per-axis test was a SQUARE while every force is a CIRCLE, so along the bottom of
+// the workspace you could sit at r = 0.95 -- past the ridge, hard on the wall --
+// with |offY| = 0.45 and get no horizontal push at all. The latch also carries an
+// enforced deadband AND a minimum dwell: without both, border tremor strobes inPush
+// and every exit slams g_pushDamp to 1.0, blanking stick output entirely.
+//
+// DIRECTION comes from how you CROSSED the border, and is decided from POSITION
+// ONLY -- the offset now versus a lagging reference of where it was ~26ms ago --
+// then HELD. With PUSH_SNAP_CARDINAL it is quantized to one of four axis
+// directions, so there is no continuous quantity left to wander. It changes only
+// if the handle physically travels PUSH_REAIM_TRAVEL from where the direction was
+// set: tremor moves ~1mm and returns, a deliberate re-aim moves 7mm and stays, so
+// the two separate without any filtering. PUSH_REAIM_TRAVEL = 0 holds the direction
+// until you leave the zone entirely.
 struct PushState2D {
-    bool inPushY = false;
-    bool inPushZ = false;
-    double entryVelY = 0.0;  // velocity captured at moment of entry
-    double entryVelZ = 0.0;
+    bool   inPush = false;
+    double entryMag = 0.0;          // stick output magnitude captured at entry
+    double heldMs = 0.0;            // time latched in push (dwell guard)
+    double dirY = 0.0, dirZ = 0.0;  // held push direction (unit; cardinal when snapping)
+    double anchorY = 0.0, anchorZ = 0.0;  // offset where the direction was last set
+    double trailY = 0.0, trailZ = 0.0;    // lagging offset reference (approach read)
+    bool   trailSeeded = false;
 
-    bool Update(double offY, double offZ, double velY, double velZ, double& outX, double& outY) {
-        // Y axis
-        if (inPushY) {
-            if (fabs(offY) < PUSH_EXIT_RAD) { inPushY = false; entryVelY = 0.0; }
+    // Dominant axis of a vector, as a unit cardinal. Ties resolve to Y.
+    static void Cardinal(double vy, double vz, double& oy, double& oz) {
+        if (fabs(vy) >= fabs(vz)) { oy = (vy >= 0.0) ? 1.0 : -1.0; oz = 0.0; }
+        else { oy = 0.0; oz = (vz >= 0.0) ? 1.0 : -1.0; }
+    }
+
+    void SetDir(double vy, double vz, double radY, double radZ, double offY, double offZ) {
+        double l = sqrt(vy * vy + vz * vz);
+        if (l > PUSH_ENTRY_MIN_TRAVEL) {
+            if (PUSH_SNAP_CARDINAL) Cardinal(vy, vz, dirY, dirZ);
+            else { dirY = vy / l; dirZ = vz / l; }
         }
-        else {
-            if (fabs(offY) >= PUSH_ENTER_RAD) {
-                inPushY = true;
-                entryVelY = outX;  // capture current stick output at entry
+        else {   // crept over too slowly to read a direction -- use where you are
+            if (PUSH_SNAP_CARDINAL) Cardinal(radY, radZ, dirY, dirZ);
+            else { dirY = radY; dirZ = radZ; }
+        }
+        anchorY = offY; anchorZ = offZ;
+    }
+
+    bool Update(double offY, double offZ, double dt, double& outX, double& outY) {
+        double r = sqrt(offY * offY + offZ * offZ);
+        double radY = 0.0, radZ = 0.0;
+        if (r > 1e-6) { radY = offY / r; radZ = offZ / r; }
+
+        // Approach vector = how far the offset has moved ahead of its lagging
+        // reference. Read BEFORE updating the reference so it reflects the lag.
+        if (!trailSeeded) { trailY = offY; trailZ = offZ; trailSeeded = true; }
+        double appY = offY - trailY, appZ = offZ - trailZ;
+        double aT = 1.0 - exp(-2.0 * 3.14159265 * PUSH_ENTRY_SMOOTH_HZ * dt);
+        trailY += aT * (offY - trailY);
+        trailZ += aT * (offZ - trailZ);
+
+        if (inPush) {
+            heldMs += dt * 1000.0;
+            if (r < PUSH_EXIT_RAD && heldMs >= (double)PUSH_MIN_MS) {
+                inPush = false; entryMag = 0.0;
             }
         }
-
-        // Z axis
-        if (inPushZ) {
-            if (fabs(offZ) < PUSH_EXIT_RAD) { inPushZ = false; entryVelZ = 0.0; }
-        }
-        else {
-            if (fabs(offZ) >= PUSH_ENTER_RAD) {
-                inPushZ = true;
-                entryVelZ = outY;  // capture current stick output at entry
-            }
+        else if (r >= PUSH_ENTER_RAD) {
+            inPush = true;
+            heldMs = 0.0;
+            entryMag = sqrt(outX * outX + outY * outY);
+            SetDir(appY, appZ, radY, radZ, offY, offZ);
         }
 
-        bool inPush = inPushY || inPushZ;
         outX = outY = 0.0;
+        if (!inPush || r < 1e-6) return inPush;
 
-        if (inPushY) {
-            double excess = (fabs(offY) - PUSH_ENTER_RAD) / (1.0 - PUSH_ENTER_RAD);
-            excess = excess < 0.0 ? 0.0 : (excess > 1.0 ? 1.0 : excess);
-            // start at entry velocity, scale up toward PUSH_SPEED_MAX with depth
-            double sign = offY >= 0.0 ? 1.0 : -1.0;
-            double base = fabs(entryVelY) > 0.01 ? fabs(entryVelY) : PUSH_SPEED_BASE;
-            double mag = base + excess * (PUSH_SPEED_MAX - base);
-            if (mag > PUSH_SPEED_MAX) mag = PUSH_SPEED_MAX;
-            outX = sign * mag;
+        // Re-aim ONLY on real handle travel from the anchor. Purely positional --
+        // no velocity, no filter, so jitter cannot reach it.
+        if (PUSH_REAIM_TRAVEL > 0.0) {
+            double dY = offY - anchorY, dZ = offZ - anchorZ;
+            if (sqrt(dY * dY + dZ * dZ) >= PUSH_REAIM_TRAVEL)
+                SetDir(dY, dZ, radY, radZ, offY, offZ);
         }
-        if (inPushZ) {
-            double excess = (fabs(offZ) - PUSH_ENTER_RAD) / (1.0 - PUSH_ENTER_RAD);
-            excess = excess < 0.0 ? 0.0 : (excess > 1.0 ? 1.0 : excess);
-            double sign = offZ >= 0.0 ? 1.0 : -1.0;
-            double base = fabs(entryVelZ) > 0.01 ? fabs(entryVelZ) : PUSH_SPEED_BASE;
-            double mag = base + excess * (PUSH_SPEED_MAX - base);
-            if (mag > PUSH_SPEED_MAX) mag = PUSH_SPEED_MAX;
-            outY = sign * mag * PUSH_VERTICAL_SCALE;   // up/down at reduced speed
-        }
+
+        // Magnitude comes from how deep past the border you are.
+        double excess = (r - PUSH_ENTER_RAD) / (1.0 - PUSH_ENTER_RAD);
+        excess = excess < 0.0 ? 0.0 : (excess > 1.0 ? 1.0 : excess);
+        double base = entryMag > 0.01 ? entryMag : PUSH_SPEED_BASE;
+        double mag = base + excess * (PUSH_SPEED_MAX - base);
+        if (mag > PUSH_SPEED_MAX) mag = PUSH_SPEED_MAX;
+
+        outX = dirY * mag;
+        outY = dirZ * mag * PUSH_VERTICAL_SCALE;   // up/down at reduced speed
         return inPush;
     }
 };
@@ -1175,18 +1304,38 @@ static void ConsoleAnchorHere() {
     g_conPrevLines = 0;
 }
 
-// Write one line at (0,row), space-padded to the console width so any longer
-// text left from a previous frame on that row is erased. Truncated to width-1.
+// Write one line at (0,row), padded to the console width so leftovers from a
+// longer previous frame on that row are erased. Width is measured in DISPLAY
+// CELLS (UTF-8 codepoints), not bytes, so a multi-byte block glyph occupies one
+// cell and is never split at the truncation boundary. Emitted via WriteConsoleW
+// (converted from UTF-8) so Unicode goes straight to the console buffer.
 static void ConWriteLine(SHORT row, const char* text) {
     COORD at = { 0, row };
     SetConsoleCursorPosition(g_hCon, at);
-    char buf[256];
+
     int w = g_conWidth - 1;
-    if (w > (int)sizeof(buf) - 1) w = (int)sizeof(buf) - 1;
-    int n = 0;
-    while (text[n] && n < w) { buf[n] = text[n]; n++; }
-    while (n < w) buf[n++] = ' ';
-    DWORD wr; WriteConsoleA(g_hCon, buf, n, &wr, NULL);
+    if (w < 1)   w = 1;
+    if (w > 240) w = 240;
+
+    char u8[1024];
+    int  b = 0, cols = 0;
+    for (int i = 0; text[i] && cols < w; ) {
+        unsigned char c = (unsigned char)text[i];
+        int len = (c < 0x80) ? 1
+            : ((c >> 5) == 0x6) ? 2
+            : ((c >> 4) == 0xE) ? 3
+            : ((c >> 3) == 0x1E) ? 4 : 1;
+        for (int k = 0; k < len && text[i + k] && b < (int)sizeof(u8) - 1; k++)
+            u8[b++] = text[i + k];
+        i += len;
+        cols++;
+    }
+    while (cols < w && b < (int)sizeof(u8) - 1) { u8[b++] = ' '; cols++; }
+    u8[b] = 0;
+
+    wchar_t wbuf[256];
+    int wn = MultiByteToWideChar(CP_UTF8, 0, u8, b, wbuf, 256);
+    DWORD wr; WriteConsoleW(g_hCon, wbuf, wn, &wr, NULL);
 }
 
 // Repaint the whole region from the cache: status line, contextual lines, then
@@ -1196,9 +1345,13 @@ static void ConsoleRepaint() {
     if (g_conAnchorY < 0) return;   // no-console: nothing to pin (notices printf'd instead)
     SHORT row = g_conAnchorY;
     ConWriteLine(row++, g_statusLine);
+    if (g_graphReady) {             // force in/out sparklines, right under the status line
+        ConWriteLine(row++, g_graphRowIn);
+        ConWriteLine(row++, g_graphRowOut);
+    }
     for (int i = 0; i < g_belowCount; i++) ConWriteLine(row++, g_belowCache[i]);
     if (g_notice[0]) ConWriteLine(row++, g_notice);
-    int drawn = 1 + g_belowCount + (g_notice[0] ? 1 : 0);
+    int drawn = 1 + (g_graphReady ? 2 : 0) + g_belowCount + (g_notice[0] ? 1 : 0);
     for (int i = drawn; i < g_conPrevLines; i++) ConWriteLine(row++, "");   // erase a taller previous frame
     g_conPrevLines = drawn;
     COORD park = { 0, row };
@@ -1214,6 +1367,39 @@ static void ConsoleNotice(const char* msg) {
     ConsoleRepaint();
 }
 
+// Rebuild the two sparkline strings from the ring (oldest->newest, left->right).
+// Each row auto-ranges independently: instant attack to the recent window max,
+// slow release. Called on the fixed render cadence, so the constant release
+// factor is loop-rate independent by construction.
+static void BuildGraphRows() {
+    // U+2581..U+2588 block glyphs (UTF-8); index 0 = space for an empty cell.
+    static const char* ramp[9] = { " ",
+        "\xE2\x96\x81", "\xE2\x96\x82", "\xE2\x96\x83", "\xE2\x96\x84",
+        "\xE2\x96\x85", "\xE2\x96\x86", "\xE2\x96\x87", "\xE2\x96\x88" };
+    double inWin = 0.0, outWin = 0.0;
+    for (int i = 0; i < GRAPH_WIDTH; i++) {
+        if (g_graphIn[i] > inWin)  inWin = g_graphIn[i];
+        if (g_graphOut[i] > outWin) outWin = g_graphOut[i];
+    }
+    if (inWin > g_graphInPeak)  g_graphInPeak = inWin;  else g_graphInPeak += (inWin - g_graphInPeak) * 0.05;
+    if (outWin > g_graphOutPeak) g_graphOutPeak = outWin; else g_graphOutPeak += (outWin - g_graphOutPeak) * 0.05;
+    double inScale = g_graphInPeak > 0.05 ? g_graphInPeak : 0.05;   // floor so a quiet game isn't full-scale noise
+    double outScale = g_graphOutPeak > 0.20 ? g_graphOutPeak : 0.20;
+
+    char sIn[GRAPH_WIDTH * 3 + 1], sOut[GRAPH_WIDTH * 3 + 1];
+    int ip = 0, op = 0;
+    for (int i = 0; i < GRAPH_WIDTH; i++) {
+        int idx = (g_graphHead + i) % GRAPH_WIDTH;
+        int li = (int)(g_graphIn[idx] / inScale * 8.0 + 0.5); if (li < 0) li = 0; if (li > 8) li = 8;
+        int lo = (int)(g_graphOut[idx] / outScale * 8.0 + 0.5); if (lo < 0) lo = 0; if (lo > 8) lo = 8;
+        for (const char* g = ramp[li]; *g; ) sIn[ip++] = *g++;
+        for (const char* h = ramp[lo]; *h; ) sOut[op++] = *h++;
+    }
+    sIn[ip] = 0; sOut[op] = 0;
+
+    snprintf(g_graphRowIn, sizeof(g_graphRowIn), "IN  %s  now=%.2f peak=%.2f", sIn, g_lastForceIn, g_graphInPeak);
+    snprintf(g_graphRowOut, sizeof(g_graphRowOut), "OUT %s  now=%.2fN peak=%.2fN", sOut, g_lastForceOut, g_graphOutPeak);
+}
 
 // ── Main ───────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
@@ -1314,7 +1500,7 @@ int main(int argc, char* argv[]) {
 
         double offY = axY.Offset(y), offZ = axZ.Offset(z);
         double stickX = 0.0, stickY = 0.0;
-        bool inPush = push.Update(offY, offZ, axY.smoothVel, axZ.smoothVel, stickX, stickY);
+        bool inPush = push.Update(offY, offZ, dt, stickX, stickY);
 
         // ── Push zone reversal damping ─────────────────────────────────────
         static bool wasInPush = false;
@@ -1338,8 +1524,7 @@ int main(int argc, char* argv[]) {
         // ── Recoil velocity bleed ──────────────────────────────────────────────
         // Prevents physical Falcon settling during recoil tail from reaching stick output
         if (g_recoilFiring) {
-            double bleedStrength = (g_recoilForce / RECOIL_MAG_SCALE);
-            bleedStrength = bleedStrength < 0.0 ? 0.0 : (bleedStrength > 1.0 ? 1.0 : bleedStrength);
+            double bleedStrength = RecoilNorm(g_recoilForce);
             // Bias: specifically gate downward (negative Z) velocity harder than upward
             // since gravity is the primary cause of the tail drift
             double bleedY = 1.0 - bleedStrength * BLEED_Y_SCALE;
@@ -1486,18 +1671,14 @@ int main(int argc, char* argv[]) {
                     g_recoilFiring = true;
                     g_rapidShotCount = 0;
                     g_recoilYZForce = 0.0;
-                    double magT = liveMag / RECOIL_MAG_SCALE;
-                    magT = magT < 0.0 ? 0.0 : (magT > 1.0 ? 1.0 : magT);
-                    g_recoilDecay = RECOIL_DECAY_MIN + magT * (RECOIL_DECAY_MAX - RECOIL_DECAY_MIN);
+                    g_recoilDecay = RecoilDecayFor(liveMag);
                 }
                 else {
                     g_rapidShotCount++;
                     if (liveMag > g_recoilForce) g_recoilForce = liveMag;
                     g_recoilPeak = g_recoilForce;
                     g_recoilYZForce = liveMag * RECOIL_YZ_SCALE;
-                    double magT = liveMag / RECOIL_MAG_SCALE;
-                    magT = magT < 0.0 ? 0.0 : (magT > 1.0 ? 1.0 : magT);
-                    g_recoilDecay = RECOIL_DECAY_MIN + magT * (RECOIL_DECAY_MAX - RECOIL_DECAY_MIN);
+                    g_recoilDecay = RecoilDecayFor(liveMag);
                 }
             }
 
@@ -1531,7 +1712,7 @@ int main(int argc, char* argv[]) {
                     if (g_recoilAttack > 1.0) g_recoilAttack = 1.0;
                     envelope = g_recoilAttack;
                 }
-                rumX = g_recoilPeak * envelope * RECOIL_X_SCALE * 2.0;
+                rumX = RecoilKickN(g_recoilPeak) * envelope;
                 // lateral texture (rumY/rumZ) rendered by the consolidated slewed block below
 
                 if (!sustainingRumble && g_recoilAttack >= 1.0) {
@@ -1562,7 +1743,7 @@ int main(int argc, char* argv[]) {
             double frameDecay = pow(g_recoilDecay, dt * 1000.0);
             g_recoilForce *= frameDecay;
             g_recoilPeak *= frameDecay;
-            rumX = g_recoilPeak * RECOIL_X_SCALE * 2.0;
+            rumX = RecoilKickN(g_recoilPeak);
             if (g_recoilForce < 0.01) { g_recoilForce = 0.0; g_recoilFiring = false; }
         }
 
@@ -1696,8 +1877,31 @@ int main(int argc, char* argv[]) {
         if (fabs(outX) > fabs(g_dbgRecoilOutN)) g_dbgRecoilOutN = outX;   // per-second peak holds
         if (outYZ > g_dbgAmbientN)         g_dbgAmbientN = outYZ;
 
+        // OUT telemetry = the rumble force only (recoil push + ambient/lateral),
+        // captured HERE before ApplyForces adds spring/friction/stiction/dither.
+        // So the graph tracks game events, not hand motion against the mechanism.
+        g_lastForceOut = sqrt(outX * outX + outYZ * outYZ);
         ApplyForces(y, z, axY, axZ, axY.smoothVel, axZ.smoothVel, rumX, rumY, rumZ, dt);
 
+        // ── Force telemetry sampling ────────────────────────────────────────
+        // IN = raw rumble demand; OUT = what ApplyForces just commanded. Peak-hold
+        // per bucket so a sub-ms spike is never averaged out, then advance the ring.
+        g_lastForceIn = (g_rumbleLargePeak * RUMBLE_LARGE_SCALE + g_rumbleSmallPeak * RUMBLE_SMALL_SCALE);
+        // Squelch the OUT baseline: friction/stiction/viscous feed-forward keeps a
+        // small (<~0.3 N) force on the handle during ordinary motion. Gate it out of
+        // the telemetry (DISPLAY ONLY — the commanded force itself is unchanged) so
+        // the trace shows real events (recoil, rumble, wall) instead of hand motion.
+        if (GRAPH_OUT_GATE_N > 0.0 && g_lastForceOut < GRAPH_OUT_GATE_N) g_lastForceOut = 0.0;
+        if (g_lastForceIn > g_bucketInMax)  g_bucketInMax = g_lastForceIn;
+        if (g_lastForceOut > g_bucketOutMax) g_bucketOutMax = g_lastForceOut;
+        g_graphBucketMs += dt * 1000.0;
+        if (g_graphBucketMs >= GRAPH_BUCKETMS) {
+            g_graphIn[g_graphHead] = g_bucketInMax;
+            g_graphOut[g_graphHead] = g_bucketOutMax;
+            g_graphHead = (g_graphHead + 1) % GRAPH_WIDTH;
+            g_bucketInMax = 0.0; g_bucketOutMax = 0.0; g_graphBucketMs = 0.0;
+            g_graphReady = true;
+        }
 
         // ── Button mask ────────────────────────────────────────────────────
         uint8_t btnMask = 0;
@@ -1775,6 +1979,14 @@ int main(int argc, char* argv[]) {
 
             ConsoleRepaint();   // status + debug lines + persistent notice (drawn as the last line)
             hz = 0; lastStats = now;
+        }
+
+        // ── Force graph redraw (decoupled ~20 Hz so the trace scrolls smoothly) ──
+        g_graphRenderMs += dt * 1000.0;
+        if (g_graphReady && g_graphRenderMs >= GRAPH_RENDERMS) {
+            g_graphRenderMs = 0.0;
+            BuildGraphRows();
+            ConsoleRepaint();
         }
 
         // ── Keyboard (throttled — 3 GetAsyncKeyState syscalls/frame at 1kHz is waste) ──

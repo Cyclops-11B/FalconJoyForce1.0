@@ -188,3 +188,28 @@
 # RECENTER_GRAV_MAX          = 0.6        # max extra gravity-comp scale added during idle to lift the handle; 0 = off
 # RECENTER_GRAV_NPS          = 0.1        # boost build rate (scale/s) while the handle isn't rising yet
 # RECENTER_RUMBLE_QUIET      = 0.5        # incoming rumble level (rL+rS) above this blocks recentering; mere packet freshness does not
+
+# ---------- Added by program: new keys since this file was created ----------
+# (commented out = compiled defaults; uncomment to override)
+# RECOIL_FULLSCALE           = 0          # liveMag treated as a max-strength shot; 0 = auto (LARGE_SCALE + SMALL_SCALE)
+# RECOIL_DRIVE_CURVE         = 0.65       # kick force curve: 1 = linear separation; lower boosts weak shots
+# RECOIL_TIME_CURVE          = 1          # duration curve: >1 reserves long sustain for the strongest shots
+
+# ---------- Added by program: new keys since this file was created ----------
+# (commented out = compiled defaults; uncomment to override)
+# PUSH_DIR_FROM_MOTION       = 1          # push direction: 0 = radial position, 1 = direction you crossed the border, between = blend
+# PUSH_DIR_SLEW_HZ           = 10         # how fast the held push direction follows your motion while moving
+# PUSH_DIR_VEL_MIN           = 0.006      # m/s below which motion direction is noise -- hold the last push direction
+
+# ---------- Added by program: new keys since this file was created ----------
+# (commented out = compiled defaults; uncomment to override)
+# PUSH_SNAP_CARDINAL         = true       # quantize push to up/down/left/right by crossing direction; false = continuous
+# PUSH_SNAP_RATIO            = 1.5        # how much faster a new axis must be to steal the push from the held one; higher = stickier
+
+# ---------- Added by program: new keys since this file was created ----------
+# (commented out = compiled defaults; uncomment to override)
+# PUSH_ENTRY_SMOOTH_HZ       = 6          # lag of the approach-direction reference at the crossing; lower = steadier
+# PUSH_ENTRY_MIN_TRAVEL      = 0.005      # approach shorter than this is unreadable -> use radial position instead
+# PUSH_REAIM_TRAVEL          = 0.12       # handle travel that re-aims the push (0.12 ~= 7mm); 0 = never re-aim until you exit
+# PUSH_MIN_MS                = 150        # minimum ms latched in push -- stops border tremor strobing the zone
+# PUSH_EXIT_MIN_HYST         = 0.05       # enforced deadband between PUSH_ENTER_RAD and PUSH_EXIT_RAD
