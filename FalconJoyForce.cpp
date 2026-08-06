@@ -73,7 +73,7 @@ static double VEL_BLEND_LOW = 0.025; // below this = low speed
 static double VEL_BLEND_HIGH = 0.15; // above this = high speed
 static double SOFT_RAMP = 0.004;  // m/s width of ramp zone
 static double SHORT_VEL_NOISE = 0.0005;  // higher suppresses more low-speed noise
-static double VEL_VLOW_POS_SCALE = 7.0;  // position error scale
+static double VEL_VLOW_POS_SCALE = 4.0;  // position error scale
 
 // Velocity estimator internals (previously hardcoded inside AxisState)
 static double VEL_FC_VLOW = 9.0;    // smoothing cutoff (Hz) in the vlow bracket — higher = less latency, more jitter
